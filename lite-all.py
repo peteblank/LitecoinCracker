@@ -7,6 +7,7 @@ import os
 import signal
 import sys
 from abc import ABC, abstractmethod
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -52,10 +53,17 @@ class Config:
     MAX_CONCURRENT_REQUESTS: int = 64
     REQUEST_DELAY: float = 0.0
 
-    # Render / HTTP Port Binding
+    # Render / HTTP Port Binding & Winner Delivery
     HOST: str = "0.0.0.0"
     PORT: int = field(default_factory=lambda: int(os.environ.get("PORT", "10000")))
     STATUS_LOG_INTERVAL: float = 15.0
+    WINNER_WEBHOOK_URL: str = field(
+        default_factory=lambda: os.environ.get("WINNER_WEBHOOK_URL", "").strip()
+    )
+    WINNER_WEBHOOK_SECRET: str = field(
+        default_factory=lambda: os.environ.get("WINNER_WEBHOOK_SECRET", "").strip()
+    )
+    MAX_RECENT_WINNERS: int = 25
 
     # Output Configuration
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("output"))
@@ -126,8 +134,8 @@ class GeneratedWallet:
     def total_balance(self) -> int:
         return sum(addr.balance for addr in self.addresses)
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, include_private_key: bool = False) -> dict:
+        data = {
             "generated_at": self.generated_at.strftime("%Y-%m-%d %H:%M:%S"),
             "has_any_balance": self.has_any_balance,
             "total_balance": self.total_balance,
@@ -141,6 +149,9 @@ class GeneratedWallet:
                 for a in self.addresses
             ],
         }
+        if include_private_key:
+            data["private_key"] = self.private_key
+        return data
 
 
 @dataclass(slots=True)
@@ -306,22 +317,56 @@ class LitecoinWalletGenerator(IWalletGenerator):
         return GeneratedWallet(private_key=private_key, addresses=addresses)
 
 
-class FileResultWriter(IResultWriter):
-    """Writes winning wallets to file."""
+class RenderResultWriter(IResultWriter):
+    """Writes winners to file, stdout logs, memory buffer, and optional webhook."""
 
-    def __init__(self, config: Config, logger: logging.Logger) -> None:
+    def __init__(
+        self,
+        config: Config,
+        logger: logging.Logger,
+        session: Optional[aiohttp.ClientSession] = None,
+        recent_winners: Optional[deque[dict]] = None,
+    ) -> None:
         self._config = config
         self._logger = logger
+        self._session = session
+        self._recent_winners = recent_winners if recent_winners is not None else deque(
+            maxlen=config.MAX_RECENT_WINNERS
+        )
         self._file_path = config.OUTPUT_DIR / config.WINNER_FILE.format(
             date=datetime.now().strftime("%Y%m%d")
         )
         self._lock = asyncio.Lock()
 
     async def write_winner(self, wallet: GeneratedWallet) -> None:
+        content = self._format_wallet(wallet)
+        record = wallet.to_dict(include_private_key=True)
+
         async with self._lock:
-            content = self._format_wallet(wallet)
+            self._recent_winners.appendleft(record)
             await asyncio.to_thread(self._write_to_file, content)
+            print(content, flush=True)
             self._logger.warning(f"Winner saved: Total balance {wallet.total_balance}")
+
+        if self._config.WINNER_WEBHOOK_URL and self._session is not None:
+            await self._send_webhook(record)
+
+    async def _send_webhook(self, payload: dict) -> None:
+        headers = {"Content-Type": "application/json"}
+        if self._config.WINNER_WEBHOOK_SECRET:
+            headers["X-Webhook-Secret"] = self._config.WINNER_WEBHOOK_SECRET
+
+        try:
+            async with self._session.post(
+                self._config.WINNER_WEBHOOK_URL,
+                json=payload,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            ) as resp:
+                if resp.status >= 400:
+                    self._logger.warning(f"Webhook returned status {resp.status}")
+        except Exception as exc:
+            self._logger.warning(f"Webhook delivery failed: {exc}")
 
     def _write_to_file(self, content: str) -> None:
         with open(self._file_path, "a", encoding="utf-8") as f:
@@ -330,7 +375,7 @@ class FileResultWriter(IResultWriter):
     def _format_wallet(self, wallet: GeneratedWallet) -> str:
         lines = [
             f"{'═' * 60}",
-            f"Found: {wallet.generated_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"WINNER FOUND: {wallet.generated_at.strftime('%Y-%m-%d %H:%M:%S')}",
             f"Private Key: {wallet.private_key}",
             f"{'─' * 60}",
         ]
@@ -431,6 +476,7 @@ class LitecoinScanner:
         logger: logging.Logger,
         console: Console,
         semaphore: Optional[DynamicSemaphore] = None,
+        recent_winners: Optional[deque[dict]] = None,
     ) -> None:
         self._config = config
         self._api = api
@@ -440,6 +486,9 @@ class LitecoinScanner:
         self._logger = logger
         self._console = console
         self._semaphore = semaphore or DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
+        self._recent_winners = recent_winners if recent_winners is not None else deque(
+            maxlen=config.MAX_RECENT_WINNERS
+        )
         self._stats = ScannerStats()
         self._running = True
         self._paused = False
@@ -453,10 +502,6 @@ class LitecoinScanner:
     def stats(self) -> ScannerStats:
         return self._stats
 
-    @property
-    def is_running(self) -> bool:
-        return self._running and not self._paused
-
     def runtime_info(self) -> dict:
         s = self._stats
         return {
@@ -465,12 +510,14 @@ class LitecoinScanner:
             "workers": self._workers_target,
             "max_concurrent_requests": self._semaphore.limit,
             "request_delay": self._request_delay,
+            "webhook_enabled": bool(self._config.WINNER_WEBHOOK_URL),
             "total_scanned": s.total_scanned,
             "winners_found": s.winners_found,
             "api_errors": s.api_errors,
             "scan_rate_per_sec": round(s.scan_rate, 2),
             "elapsed": s.elapsed_time,
-            "latest_wallet": self._latest_wallet.to_dict() if self._latest_wallet else None,
+            "latest_wallet": self._latest_wallet.to_dict(include_private_key=False) if self._latest_wallet else None,
+            "recent_winners": list(self._recent_winners),
         }
 
     def _reconcile_workers(self) -> None:
@@ -507,7 +554,7 @@ class LitecoinScanner:
     async def scan_once(self) -> dict:
         wallet = self._generator.generate()
         await self.process_wallet(wallet)
-        return wallet.to_dict()
+        return wallet.to_dict(include_private_key=False)
 
     async def _fetch_address_info(self, address: WalletAddress) -> None:
         try:
@@ -601,7 +648,8 @@ class LitecoinScanner:
                     ui_task.cancel()
             else:
                 print(
-                    f"Running in headless mode on {self._config.HOST}:{self._config.PORT}",
+                    f"Running in headless mode on {self._config.HOST}:{self._config.PORT} "
+                    f"(webhook={'ON' if self._config.WINNER_WEBHOOK_URL else 'OFF'})",
                     flush=True,
                 )
                 status_task = asyncio.create_task(self._headless_status_loop())
@@ -663,7 +711,6 @@ HTML_PAGE = """<!DOCTYPE html>
       --accent: #38bdf8;
       --green: #22c55e;
       --amber: #f59e0b;
-      --red: #ef4444;
     }
     * { box-sizing: border-box; }
     body {
@@ -710,7 +757,7 @@ HTML_PAGE = """<!DOCTYPE html>
       flex-wrap: wrap;
       gap: 12px;
       align-items: end;
-      margin-bottom: 20px;
+      margin-bottom: 8px;
     }
     .field { display: flex; flex-direction: column; gap: 6px; }
     .field label { font-size: 0.8rem; color: var(--muted); }
@@ -758,7 +805,10 @@ HTML_PAGE = """<!DOCTYPE html>
   <div class="container">
     <div class="header">
       <h1>Litecoin Scanner</h1>
-      <span id="statusBadge" class="badge">Loading...</span>
+      <div>
+        <span id="webhookBadge" class="badge">Webhook: checking...</span>
+        <span id="statusBadge" class="badge">Loading...</span>
+      </div>
     </div>
 
     <div class="grid">
@@ -788,6 +838,11 @@ HTML_PAGE = """<!DOCTYPE html>
         <button class="secondary" onclick="saveConfig()">Apply Settings</button>
       </div>
       <div id="feedback" class="msg"></div>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+      <div class="label">Recent Winners (In-Memory Session Buffer)</div>
+      <div id="recentWinners" class="msg">No winners found yet.</div>
     </div>
 
     <div class="card">
@@ -820,6 +875,10 @@ HTML_PAGE = """<!DOCTYPE html>
       badge.textContent = data.status.toUpperCase();
       badge.style.color = data.status === "running" ? "#22c55e" : "#f59e0b";
 
+      const wh = document.getElementById("webhookBadge");
+      wh.textContent = data.webhook_enabled ? "Webhook: ON" : "Webhook: OFF";
+      wh.style.color = data.webhook_enabled ? "#22c55e" : "#8b949e";
+
       document.getElementById("scanned").textContent = Number(data.total_scanned).toLocaleString();
       document.getElementById("winners").textContent = Number(data.winners_found).toLocaleString();
       document.getElementById("rate").textContent = `${Number(data.scan_rate_per_sec).toFixed(2)}/s`;
@@ -832,6 +891,18 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById("concInput").value = data.max_concurrent_requests;
         document.getElementById("delayInput").value = data.request_delay;
         inputsInitialized = true;
+      }
+
+      const rw = document.getElementById("recentWinners");
+      if (Array.isArray(data.recent_winners) && data.recent_winners.length > 0) {
+        rw.innerHTML = data.recent_winners.map(w => `
+          <div style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border);">
+            <div><strong>${w.generated_at}</strong> | Total Balance: <strong>${w.total_balance}</strong></div>
+            <div class="mono">Key: ${w.private_key}</div>
+          </div>
+        `).join("");
+      } else {
+        rw.textContent = "No winners found yet.";
       }
 
       const tbody = document.getElementById("walletRows");
@@ -965,6 +1036,7 @@ async def main() -> None:
     console = Console()
     logger = setup_logging(config)
     semaphore = DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
+    recent_winners: deque[dict] = deque(maxlen=config.MAX_RECENT_WINNERS)
 
     connector = aiohttp.TCPConnector(
         limit=max(config.MAX_CONCURRENT_REQUESTS * 2, 128),
@@ -977,7 +1049,7 @@ async def main() -> None:
     async with aiohttp.ClientSession(connector=connector) as session:
         api = LitecoinAPI(config, logger, session, semaphore=semaphore)
         generator = LitecoinWalletGenerator()
-        writer = FileResultWriter(config, logger)
+        writer = RenderResultWriter(config, logger, session=session, recent_winners=recent_winners)
         display = DisplayManager(console)
 
         scanner = LitecoinScanner(
@@ -989,6 +1061,7 @@ async def main() -> None:
             logger=logger,
             console=console,
             semaphore=semaphore,
+            recent_winners=recent_winners,
         )
 
         runner = await start_render_server(config, scanner)
