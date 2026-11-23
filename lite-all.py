@@ -1,40 +1,37 @@
 # -*- coding: utf-8 -*-
-"""
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                    Litecoin Wallet Scanner - Professional Edition            ║
-║══════════════════════════════════════════════════════════════════════════════║
-║  Description : High-performance Litecoin address generator & balance checker ║
-║  Author      : M M D R Z A                                                   ║
-║  Website     : Mmdrza.Com                                                    ║
-║  Contact     : Info@Mmdrza.Com | Telegram: @Mr1Mmdrza                        ║
-║  Repository  : Github.Com/Pymmdrza/LitecoinCracker                           ║
-╚══════════════════════════════════════════════════════════════════════════════╝
-"""
-
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import random
 import signal
 import sys
 from abc import ABC, abstractmethod
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import Optional
 
 import aiohttp
 from libcrypto import Wallet
 from rich import box
 from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+
+# Optional faster JSON parser if installed
+try:
+    import orjson as _json_lib
+    def _loads(raw: bytes | str) -> dict:
+        return _json_lib.loads(raw)
+except ImportError:
+    import json as _json_lib
+    def _loads(raw: bytes | str) -> dict:
+        return _json_lib.loads(raw)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
@@ -44,15 +41,15 @@ from rich.table import Table
 class Config:
     """Application configuration settings."""
 
-    # API Configuration
     API_BASE_URL: str = "https://litecoin.atomicwallet.io/api/address"
-    API_TIMEOUT: int = 10
-    API_RETRY_ATTEMPTS: int = 3
-    API_RETRY_DELAY: float = 1.0
+    API_TIMEOUT: float = 6.0
+    API_RETRY_ATTEMPTS: int = 2
+    API_RETRY_DELAY: float = 0.25
 
-    # Concurrency Settings
-    MAX_CONCURRENT_REQUESTS: int = 4
-    REQUEST_DELAY: float = 0.25
+    # Pipeline & Concurrency Settings
+    WORKERS: int = 32
+    MAX_CONCURRENT_REQUESTS: int = 64
+    REQUEST_DELAY: float = 0.0
 
     # Output Configuration
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("output"))
@@ -60,13 +57,12 @@ class Config:
     LOG_FILE: str = "ltc_scanner_{date}.log"
 
     # Display Settings
-    REFRESH_RATE: float = 0.1
-    SHOW_PROGRESS: bool = True
+    REFRESH_PER_SECOND: int = 10
 
     def __post_init__(self) -> None:
-        """Ensure output directory exists."""
-        object.__setattr__(self, "OUTPUT_DIR", Path(self.OUTPUT_DIR))
-        self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out = Path(self.OUTPUT_DIR)
+        object.__setattr__(self, "OUTPUT_DIR", out)
+        out.mkdir(parents=True, exist_ok=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -82,7 +78,6 @@ class AddressType(Enum):
 
     @property
     def display_name(self) -> str:
-        """Human-readable address type name."""
         return {
             AddressType.P2PKH: "LTC-P2PKH",
             AddressType.P2SH_P2WPKH: "LTC-P2SH-P2WPKH",
@@ -90,7 +85,10 @@ class AddressType(Enum):
         }[self]
 
 
-@dataclass
+ADDRESS_TYPES = tuple(AddressType)
+
+
+@dataclass(slots=True)
 class WalletAddress:
     """Represents a wallet address with its metadata."""
 
@@ -103,54 +101,45 @@ class WalletAddress:
 
     @property
     def has_balance(self) -> bool:
-        """Check if address has positive balance."""
         return self.balance > 0
 
-    @property
-    def has_history(self) -> bool:
-        """Check if address has any transaction history."""
-        return self.tx_count > 0 or self.total_received > 0
 
-
-@dataclass
+@dataclass(slots=True)
 class GeneratedWallet:
     """Represents a complete generated wallet with all address types."""
 
     private_key: str
-    addresses: list[WalletAddress] = field(default_factory=list)
+    addresses: list[WalletAddress]
     generated_at: datetime = field(default_factory=datetime.now)
 
     @property
     def has_any_balance(self) -> bool:
-        """Check if any address has balance."""
         return any(addr.has_balance for addr in self.addresses)
 
     @property
     def total_balance(self) -> int:
-        """Sum of all address balances."""
         return sum(addr.balance for addr in self.addresses)
 
 
-@dataclass
+@dataclass(slots=True)
 class ScannerStats:
     """Scanner statistics tracker."""
 
     total_scanned: int = 0
     winners_found: int = 0
     api_errors: int = 0
-    start_time: datetime = field(default_factory=datetime.now)
+    start_time: float = field(default_factory=asyncio.get_event_loop) if False else 0.0
+    start_dt: datetime = field(default_factory=datetime.now)
 
     @property
     def scan_rate(self) -> float:
-        """Calculate scans per second."""
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        return self.total_scanned / max(elapsed, 1)
+        elapsed = (datetime.now() - self.start_dt).total_seconds()
+        return self.total_scanned / max(elapsed, 0.001)
 
     @property
     def elapsed_time(self) -> str:
-        """Format elapsed time."""
-        elapsed = datetime.now() - self.start_time
-        hours, remainder = divmod(int(elapsed.total_seconds()), 3600)
+        elapsed = int((datetime.now() - self.start_dt).total_seconds())
+        hours, remainder = divmod(elapsed, 3600)
         minutes, seconds = divmod(remainder, 60)
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
@@ -166,11 +155,11 @@ def setup_logging(config: Config) -> logging.Logger:
     )
 
     logger = logging.getLogger("LTCScanner")
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.WARNING)
+    logger.handlers.clear()
 
-    # File handler
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
+    file_handler.setLevel(logging.WARNING)
     file_formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
@@ -181,117 +170,70 @@ def setup_logging(config: Config) -> logging.Logger:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Abstract Base Classes
+# Abstract Base Classes & Implementations
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 class IBlockchainAPI(ABC):
-    """Interface for blockchain API interactions."""
-
     @abstractmethod
     async def get_address_info(self, address: str) -> dict:
-        """Fetch address information from blockchain."""
-        pass
-
-    @abstractmethod
-    async def close(self) -> None:
-        """Clean up resources."""
         pass
 
 
 class IWalletGenerator(ABC):
-    """Interface for wallet generation."""
-
     @abstractmethod
     def generate(self) -> GeneratedWallet:
-        """Generate a new wallet."""
         pass
 
 
 class IResultWriter(ABC):
-    """Interface for writing scan results."""
-
     @abstractmethod
     async def write_winner(self, wallet: GeneratedWallet) -> None:
-        """Write winning wallet to storage."""
         pass
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Implementation Classes
-# ══════════════════════════════════════════════════════════════════════════════
-
-
 class LitecoinAPI(IBlockchainAPI):
-    """Litecoin blockchain API client with retry logic."""
+    """High-throughput Litecoin blockchain API client with pooled connections."""
 
     def __init__(
         self,
         config: Config,
         logger: logging.Logger,
-        session: Optional[aiohttp.ClientSession] = None,
+        session: aiohttp.ClientSession,
     ) -> None:
         self._config = config
         self._logger = logger
         self._session = session
         self._semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
-
-    @asynccontextmanager
-    async def _get_session(self) -> AsyncIterator[aiohttp.ClientSession]:
-        """Get or create HTTP session."""
-        if self._session is not None:
-            yield self._session
-        else:
-            async with aiohttp.ClientSession() as session:
-                yield session
+        self._timeout = aiohttp.ClientTimeout(total=config.API_TIMEOUT)
+        self._base = config.API_BASE_URL.rstrip("/")
 
     async def get_address_info(self, address: str) -> dict:
-        """Fetch address information with retry logic."""
-        url = f"{self._config.API_BASE_URL}/{address}?details=basic"
+        url = f"{self._base}/{address}?details=basic"
 
         async with self._semaphore:
             for attempt in range(self._config.API_RETRY_ATTEMPTS):
                 try:
-                    async with self._get_session() as session:
-                        async with session.get(
-                            url,
-                            timeout=aiohttp.ClientTimeout(
-                                total=self._config.API_TIMEOUT
-                            ),
-                        ) as response:
-                            if response.status == 200:
-                                return await response.json()
-
-                            self._logger.warning(
-                                f"API returned status {response.status} for {address}"
-                            )
-
-                except asyncio.TimeoutError:
-                    self._logger.warning(
-                        f"Timeout fetching {address} (attempt {attempt + 1})"
-                    )
-                except aiohttp.ClientError as e:
-                    self._logger.warning(
-                        f"Client error for {address}: {e} (attempt {attempt + 1})"
-                    )
+                    async with self._session.get(url, timeout=self._timeout) as resp:
+                        if resp.status == 200:
+                            raw = await resp.read()
+                            return _loads(raw)
+                        if resp.status == 429:
+                            await asyncio.sleep(self._config.API_RETRY_DELAY * (attempt + 1))
+                            continue
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    pass
 
                 if attempt < self._config.API_RETRY_ATTEMPTS - 1:
                     await asyncio.sleep(self._config.API_RETRY_DELAY * (attempt + 1))
 
             return {"balance": 0, "error": True}
 
-    async def close(self) -> None:
-        """Close the session if owned."""
-        if self._session is not None:
-            await self._session.close()
-
 
 class LitecoinWalletGenerator(IWalletGenerator):
-    """Generates Litecoin wallets with multiple address types."""
+    """Generates Litecoin wallets using cryptographic randomness."""
 
     def generate(self) -> GeneratedWallet:
-        """Generate a new wallet with all address types."""
-        private_key = "%064x" % random.getrandbits(256)
+        private_key = os.urandom(32).hex()
         wallet = Wallet(private_key)
 
         addresses = [
@@ -299,7 +241,7 @@ class LitecoinWalletGenerator(IWalletGenerator):
                 address=wallet.get_address("litecoin", address_type=addr_type.value),
                 address_type=addr_type,
             )
-            for addr_type in AddressType
+            for addr_type in ADDRESS_TYPES
         ]
 
         return GeneratedWallet(private_key=private_key, addresses=addresses)
@@ -317,36 +259,27 @@ class FileResultWriter(IResultWriter):
         self._lock = asyncio.Lock()
 
     async def write_winner(self, wallet: GeneratedWallet) -> None:
-        """Write winning wallet to file with async lock."""
         async with self._lock:
             content = self._format_wallet(wallet)
-
-            # Use sync file I/O in executor for better performance
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._write_to_file, content)
-
-            self._logger.info(f"Winner saved: Total balance {wallet.total_balance}")
+            await asyncio.to_thread(self._write_to_file, content)
+            self._logger.warning(f"Winner saved: Total balance {wallet.total_balance}")
 
     def _write_to_file(self, content: str) -> None:
-        """Synchronous file write operation."""
         with open(self._file_path, "a", encoding="utf-8") as f:
             f.write(content)
 
     def _format_wallet(self, wallet: GeneratedWallet) -> str:
-        """Format wallet data for file output."""
         lines = [
             f"{'═' * 60}",
             f"Found: {wallet.generated_at.strftime('%Y-%m-%d %H:%M:%S')}",
             f"Private Key: {wallet.private_key}",
             f"{'─' * 60}",
         ]
-
         for addr in wallet.addresses:
             lines.append(
                 f"{addr.address_type.display_name}: {addr.address} | "
                 f"Balance: {addr.balance} | TxCount: {addr.tx_count}"
             )
-
         lines.extend([f"{'═' * 60}", ""])
         return "\n".join(lines)
 
@@ -355,7 +288,6 @@ class FileResultWriter(IResultWriter):
 # Display Manager
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 class DisplayManager:
     """Manages rich console output."""
 
@@ -363,9 +295,8 @@ class DisplayManager:
         self._console = console
 
     def create_wallet_table(
-        self, wallet: GeneratedWallet, stats: ScannerStats
+        self, wallet: Optional[GeneratedWallet], stats: ScannerStats
     ) -> Table:
-        """Create a formatted table for wallet display."""
         table = Table(
             title=self._create_title(stats),
             title_style="bold cyan",
@@ -383,19 +314,19 @@ class DisplayManager:
         table.add_column("Balance", justify="right", style="gold1", width=15)
         table.add_column("TxCount", justify="right", style="cyan", width=10)
 
-        for addr in wallet.addresses:
-            balance_style = "bold green" if addr.has_balance else "dim"
-            table.add_row(
-                addr.address_type.display_name,
-                addr.address,
-                f"[{balance_style}]{addr.balance:,}[/]",
-                str(addr.tx_count),
-            )
+        if wallet is not None:
+            for addr in wallet.addresses:
+                balance_style = "bold green" if addr.has_balance else "dim"
+                table.add_row(
+                    addr.address_type.display_name,
+                    addr.address,
+                    f"[{balance_style}]{addr.balance:,}[/]",
+                    str(addr.tx_count),
+                )
 
         return table
 
     def create_stats_panel(self, stats: ScannerStats) -> Panel:
-        """Create statistics panel."""
         content = (
             f"[cyan]Scanned:[/] {stats.total_scanned:,} | "
             f"[green]Winners:[/] {stats.winners_found} | "
@@ -406,7 +337,6 @@ class DisplayManager:
         return Panel(content, title="Statistics", border_style="blue")
 
     def _create_title(self, stats: ScannerStats) -> str:
-        """Create table title with stats."""
         return (
             f"[bold gold1]⚡ Litecoin Scanner[/] │ "
             f"[cyan]Scan #{stats.total_scanned:,}[/] │ "
@@ -414,7 +344,6 @@ class DisplayManager:
         )
 
     def print_banner(self) -> None:
-        """Print application banner."""
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
 ║[/][bold gold1]          ⚡ LITECOIN WALLET SCANNER - PRO EDITION ⚡            [/][bold cyan]║
@@ -430,9 +359,8 @@ class DisplayManager:
 # Main Scanner Engine
 # ══════════════════════════════════════════════════════════════════════════════
 
-
 class LitecoinScanner:
-    """Main scanner orchestrator."""
+    """Concurrent pipelined scanner orchestrator."""
 
     def __init__(
         self,
@@ -442,6 +370,7 @@ class LitecoinScanner:
         writer: IResultWriter,
         display: DisplayManager,
         logger: logging.Logger,
+        console: Console,
     ) -> None:
         self._config = config
         self._api = api
@@ -449,83 +378,82 @@ class LitecoinScanner:
         self._writer = writer
         self._display = display
         self._logger = logger
+        self._console = console
         self._stats = ScannerStats()
         self._running = True
-        self._console = Console()
-
-    async def scan_wallet(self, wallet: GeneratedWallet) -> None:
-        """Scan all addresses in a wallet for balances."""
-        tasks = [self._fetch_address_info(addr) for addr in wallet.addresses]
-        await asyncio.gather(*tasks)
+        self._latest_wallet: Optional[GeneratedWallet] = None
 
     async def _fetch_address_info(self, address: WalletAddress) -> None:
-        """Fetch and update address information."""
         try:
             info = await self._api.get_address_info(address.address)
-            address.balance = int(info.get("balance", 0))
-            address.total_received = int(info.get("totalReceived", 0))
-            address.total_sent = int(info.get("totalSent", 0))
-            address.tx_count = int(info.get("txs", 0))
+            address.balance = int(info.get("balance", 0) or 0)
+            address.total_received = int(info.get("totalReceived", 0) or 0)
+            address.total_sent = int(info.get("totalSent", 0) or 0)
+            address.tx_count = int(info.get("txs", 0) or 0)
 
             if info.get("error"):
                 self._stats.api_errors += 1
-
         except (ValueError, TypeError) as e:
             self._logger.error(f"Error parsing response for {address.address}: {e}")
             self._stats.api_errors += 1
 
     async def process_wallet(self, wallet: GeneratedWallet) -> None:
-        """Process a single wallet: scan and handle results."""
-        await self.scan_wallet(wallet)
+        await asyncio.gather(*(self._fetch_address_info(a) for a in wallet.addresses))
 
         if wallet.has_any_balance:
             self._stats.winners_found += 1
             await self._writer.write_winner(wallet)
-            self._logger.info(f"🎉 WINNER FOUND! Balance: {wallet.total_balance}")
 
         self._stats.total_scanned += 1
+        self._latest_wallet = wallet
+
+    async def _worker(self) -> None:
+        while self._running:
+            wallet = self._generator.generate()
+            await self.process_wallet(wallet)
+            if self._config.REQUEST_DELAY > 0:
+                await asyncio.sleep(self._config.REQUEST_DELAY)
+
+    async def _ui_loop(self, live: Live) -> None:
+        layout = Layout()
+        stats_layout = Layout(name="stats", size=3)
+        table_layout = Layout(name="table")
+        layout.split_column(stats_layout, table_layout)
+
+        interval = 1.0 / max(self._config.REFRESH_PER_SECOND, 1)
+        while self._running:
+            stats_layout.update(self._display.create_stats_panel(self._stats))
+            table_layout.update(
+                self._display.create_wallet_table(self._latest_wallet, self._stats)
+            )
+            live.update(layout)
+            await asyncio.sleep(interval)
 
     def stop(self) -> None:
-        """Signal scanner to stop."""
         self._running = False
-        self._logger.info("Shutdown signal received")
 
     async def run(self) -> None:
-        """Main scanning loop."""
         self._display.print_banner()
-        self._logger.info("Scanner started")
+        workers = [asyncio.create_task(self._worker()) for _ in range(self._config.WORKERS)]
 
         try:
             with Live(
                 self._display.create_stats_panel(self._stats),
                 console=self._console,
-                refresh_per_second=10,
+                refresh_per_second=self._config.REFRESH_PER_SECOND,
                 transient=True,
             ) as live:
-                while self._running:
-                    wallet = self._generator.generate()
-                    await self.process_wallet(wallet)
-
-                    # Update display
-                    table = self._display.create_wallet_table(wallet, self._stats)
-                    stats_panel = self._display.create_stats_panel(self._stats)
-
-                    from rich.layout import Layout
-
-                    layout = Layout()
-                    layout.split_column(Layout(stats_panel, size=3), Layout(table))
-                    live.update(layout)
-
-                    # Rate limiting
-                    await asyncio.sleep(self._config.REQUEST_DELAY)
-
+                ui_task = asyncio.create_task(self._ui_loop(live))
+                await asyncio.gather(*workers)
+                ui_task.cancel()
         except asyncio.CancelledError:
-            self._logger.info("Scanner cancelled")
+            pass
         finally:
+            self._running = False
+            await asyncio.gather(*workers, return_exceptions=True)
             self._print_summary()
 
     def _print_summary(self) -> None:
-        """Print final summary."""
         summary = f"""
 [bold green]╔══════════════════════════════════════════════════════════════════╗
 ║                        SCAN COMPLETE                             ║
@@ -538,10 +466,6 @@ class LitecoinScanner:
 ╚══════════════════════════════════════════════════════════════════╝[/]
 """
         self._console.print(summary)
-        self._logger.info(
-            f"Scan complete: {self._stats.total_scanned} scanned, "
-            f"{self._stats.winners_found} winners"
-        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -549,13 +473,17 @@ class LitecoinScanner:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def main() -> None:
-    """Application entry point."""
     config = Config()
     console = Console()
     logger = setup_logging(config)
 
-    # Initialize components
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(
+        limit=config.MAX_CONCURRENT_REQUESTS * 2,
+        limit_per_host=config.MAX_CONCURRENT_REQUESTS,
+        ttl_dns_cache=300,
+    )
+
+    async with aiohttp.ClientSession(connector=connector) as session:
         api = LitecoinAPI(config, logger, session)
         generator = LitecoinWalletGenerator()
         writer = FileResultWriter(config, logger)
@@ -568,25 +496,18 @@ async def main() -> None:
             writer=writer,
             display=display,
             logger=logger,
+            console=console,
         )
 
-        # Setup signal handlers for graceful shutdown
-        loop = asyncio.get_event_loop()
-
-        def signal_handler():
-            scanner.stop()
-
+        loop = asyncio.get_running_loop()
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, signal_handler)
+                loop.add_signal_handler(sig, scanner.stop)
 
         try:
             await scanner.run()
         except KeyboardInterrupt:
             scanner.stop()
-            console.print("\n[yellow]Shutting down gracefully...[/]")
-        finally:
-            await api.close()
 
 
 if __name__ == "__main__":
