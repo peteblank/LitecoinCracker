@@ -37,10 +37,22 @@ except ImportError:
 
 
 DEFAULT_CANDIDATE_SEEDS: list[str] = [
-    "maze lizard hammer peanut globe few wolf swallow truly rough comfort legal",
-    "motor forest luxury describe arrest figure office garment leisure sentence use expand",
 ]
+def load_candidate_seeds(config: Config) -> list[str]:
+    """Loads candidate seed phrases from DEFAULT_CANDIDATE_SEEDS plus output.txt if present."""
+    seeds: list[str] = [s.strip() for s in DEFAULT_CANDIDATE_SEEDS if s and s.strip()]
+    seen = set(seeds)
 
+    candidate_path = config.CANDIDATE_SEEDS_FILE or Path("output.txt")
+    if candidate_path.exists():
+        lines = candidate_path.read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            cleaned = line.strip()
+            if cleaned and not cleaned.startswith("#") and cleaned not in seen:
+                seen.add(cleaned)
+                seeds.append(cleaned)
+
+    return seeds if seeds else list(DEFAULT_CANDIDATE_SEEDS)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
