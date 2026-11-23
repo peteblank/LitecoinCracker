@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import signal
@@ -16,7 +17,7 @@ from typing import Optional
 
 import aiohttp
 from aiohttp import web
-from libcrypto import Wallet
+from libcrypto import HDWallet, Wallet, generate_mnemonic
 from rich import box
 from rich.console import Console
 from rich.layout import Layout
@@ -47,6 +48,10 @@ class Config:
     API_TIMEOUT: float = 6.0
     API_RETRY_ATTEMPTS: int = 2
     API_RETRY_DELAY: float = 0.25
+
+    # Seed / Mnemonic Settings
+    MNEMONIC_WORDS: int = 12  # 12, 15, 18, 21, or 24
+    MNEMONIC_PASSPHRASE: str = ""
 
     # Pipeline & Concurrency Settings
     WORKERS: int = 32
@@ -120,8 +125,9 @@ class WalletAddress:
 
 @dataclass(slots=True)
 class GeneratedWallet:
-    """Represents a complete generated wallet with all address types."""
+    """Represents a complete generated wallet derived from a mnemonic seed."""
 
+    mnemonic: str
     private_key: str
     addresses: list[WalletAddress]
     generated_at: datetime = field(default_factory=datetime.now)
@@ -134,7 +140,7 @@ class GeneratedWallet:
     def total_balance(self) -> int:
         return sum(addr.balance for addr in self.addresses)
 
-    def to_dict(self, include_private_key: bool = False) -> dict:
+    def to_dict(self, include_secrets: bool = False) -> dict:
         data = {
             "generated_at": self.generated_at.strftime("%Y-%m-%d %H:%M:%S"),
             "has_any_balance": self.has_any_balance,
@@ -149,7 +155,8 @@ class GeneratedWallet:
                 for a in self.addresses
             ],
         }
-        if include_private_key:
+        if include_secrets:
+            data["mnemonic"] = self.mnemonic
             data["private_key"] = self.private_key
         return data
 
@@ -299,11 +306,35 @@ class LitecoinAPI(IBlockchainAPI):
             return {"balance": 0, "error": True}
 
 
-class LitecoinWalletGenerator(IWalletGenerator):
-    """Generates Litecoin wallets using cryptographic randomness."""
+class LitecoinSeedWalletGenerator(IWalletGenerator):
+    """Generates BIP39 mnemonic seeds and derives Litecoin wallets/addresses."""
+
+    def __init__(self, words: int = 12, passphrase: str = "") -> None:
+        self._words = words
+        self._passphrase = passphrase
+
+    def _private_key_from_mnemonic(self, mnemonic: str) -> str:
+        try:
+            hd = HDWallet.from_mnemonic(mnemonic, passphrase=self._passphrase)
+            for attr in ("private_key_hex", "private_key", "privkey"):
+                val = getattr(hd, attr, None)
+                if isinstance(val, str) and len(val) == 64:
+                    return val
+        except Exception:
+            pass
+
+        seed_bytes = hashlib.pbkdf2_hmac(
+            "sha512",
+            mnemonic.encode("utf-8"),
+            f"mnemonic{self._passphrase}".encode("utf-8"),
+            2048,
+            dklen=32,
+        )
+        return seed_bytes.hex()
 
     def generate(self) -> GeneratedWallet:
-        private_key = os.urandom(32).hex()
+        mnemonic = generate_mnemonic(self._words)
+        private_key = self._private_key_from_mnemonic(mnemonic)
         wallet = Wallet(private_key)
 
         addresses = [
@@ -314,7 +345,11 @@ class LitecoinWalletGenerator(IWalletGenerator):
             for addr_type in ADDRESS_TYPES
         ]
 
-        return GeneratedWallet(private_key=private_key, addresses=addresses)
+        return GeneratedWallet(
+            mnemonic=mnemonic,
+            private_key=private_key,
+            addresses=addresses,
+        )
 
 
 class RenderResultWriter(IResultWriter):
@@ -340,7 +375,7 @@ class RenderResultWriter(IResultWriter):
 
     async def write_winner(self, wallet: GeneratedWallet) -> None:
         content = self._format_wallet(wallet)
-        record = wallet.to_dict(include_private_key=True)
+        record = wallet.to_dict(include_secrets=True)
 
         async with self._lock:
             self._recent_winners.appendleft(record)
@@ -376,6 +411,7 @@ class RenderResultWriter(IResultWriter):
         lines = [
             f"{'═' * 60}",
             f"WINNER FOUND: {wallet.generated_at.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"Seed Phrase: {wallet.mnemonic}",
             f"Private Key: {wallet.private_key}",
             f"{'─' * 60}",
         ]
@@ -442,7 +478,7 @@ class DisplayManager:
 
     def _create_title(self, stats: ScannerStats) -> str:
         return (
-            f"[bold gold1]Litecoin Scanner[/] | "
+            f"[bold gold1]Litecoin Seed Scanner[/] | "
             f"[cyan]Scan #{stats.total_scanned:,}[/] | "
             f"[green]Winners: {stats.winners_found}[/]"
         )
@@ -450,9 +486,9 @@ class DisplayManager:
     def print_banner(self) -> None:
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
-║[/][bold gold1]          LITECOIN WALLET SCANNER - PRO EDITION            [/][bold cyan]║
+║[/][bold gold1]          LITECOIN SEED SCANNER - PRO EDITION              [/][bold cyan]║
 ║══════════════════════════════════════════════════════════════════║
-║[/]  [dim]High-Performance Address Generator & Balance Checker[/]         [bold cyan]║
+║[/]  [dim]BIP39 Seed Generator & Litecoin Balance Checker[/]            [bold cyan]║
 ║[/]  [dim]Press Ctrl+C to stop scanning gracefully[/]                     [bold cyan]║
 ╚══════════════════════════════════════════════════════════════════╝[/]
 """
@@ -464,7 +500,7 @@ class DisplayManager:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LitecoinScanner:
-    """Concurrent pipelined scanner orchestrator with live runtime controls."""
+    """Concurrent pipelined seed scanner orchestrator with live runtime controls."""
 
     def __init__(
         self,
@@ -507,6 +543,7 @@ class LitecoinScanner:
         return {
             "status": "stopped" if not self._running else ("paused" if self._paused else "running"),
             "paused": self._paused,
+            "mode": f"seed-{self._config.MNEMONIC_WORDS}w",
             "workers": self._workers_target,
             "max_concurrent_requests": self._semaphore.limit,
             "request_delay": self._request_delay,
@@ -516,7 +553,7 @@ class LitecoinScanner:
             "api_errors": s.api_errors,
             "scan_rate_per_sec": round(s.scan_rate, 2),
             "elapsed": s.elapsed_time,
-            "latest_wallet": self._latest_wallet.to_dict(include_private_key=False) if self._latest_wallet else None,
+            "latest_wallet": self._latest_wallet.to_dict(include_secrets=False) if self._latest_wallet else None,
             "recent_winners": list(self._recent_winners),
         }
 
@@ -554,7 +591,7 @@ class LitecoinScanner:
     async def scan_once(self) -> dict:
         wallet = self._generator.generate()
         await self.process_wallet(wallet)
-        return wallet.to_dict(include_private_key=False)
+        return wallet.to_dict(include_secrets=False)
 
     async def _fetch_address_info(self, address: WalletAddress) -> None:
         try:
@@ -648,7 +685,8 @@ class LitecoinScanner:
                     ui_task.cancel()
             else:
                 print(
-                    f"Running in headless mode on {self._config.HOST}:{self._config.PORT} "
+                    f"Running seed scanner ({self._config.MNEMONIC_WORDS}w) on "
+                    f"{self._config.HOST}:{self._config.PORT} "
                     f"(webhook={'ON' if self._config.WINNER_WEBHOOK_URL else 'OFF'})",
                     flush=True,
                 )
@@ -695,12 +733,12 @@ class LitecoinScanner:
 # Render HTTP Server & Interactive HTML Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Litecoin Scanner Panel</title>
+  <title>Litecoin Seed Scanner Panel</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -833,8 +871,9 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Litecoin Scanner Panel</h1>
+      <h1>Litecoin Seed Scanner Panel</h1>
       <div>
+        <span id="modeBadge" class="badge">Seed Mode</span>
         <span id="webhookBadge" class="badge">Webhook: checking...</span>
         <span id="statusBadge" class="badge">Loading...</span>
       </div>
@@ -851,7 +890,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="card">
       <div class="controls">
         <button id="toggleBtn" onclick="toggleRun()">Pause</button>
-        <button class="secondary" onclick="scanOnce()">Scan 1 Wallet Now</button>
+        <button class="secondary" onclick="scanOnce()">Scan 1 Seed Now</button>
         <div class="field">
           <label for="workersInput">Workers</label>
           <input id="workersInput" type="number" min="1" max="256" step="1" />
@@ -875,7 +914,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div class="label">Latest Checked Wallet (<span id="latestTime">-</span>)</div>
+      <div class="label">Latest Checked Seed Wallet (<span id="latestTime">-</span>)</div>
       <table>
         <thead>
           <tr>
@@ -958,13 +997,19 @@ HTML_PAGE = """<!DOCTYPE html>
           el("span", "winner-balance", `Total Balance: ${Number(w.total_balance || 0).toLocaleString()}`)
         );
 
-        const copyBtn = el("button", "secondary small", "Copy Private Key");
-        copyBtn.type = "button";
-        copyBtn.addEventListener("click", () => copyText(w.private_key || "", copyBtn));
+        const copySeedBtn = el("button", "secondary small", "Copy Seed");
+        copySeedBtn.type = "button";
+        copySeedBtn.addEventListener("click", () => copyText(w.mnemonic || "", copySeedBtn));
 
         top.appendChild(meta);
-        top.appendChild(copyBtn);
+        top.appendChild(copySeedBtn);
         box.appendChild(top);
+
+        const seedLine = el("div", "mono");
+        seedLine.style.marginBottom = "6px";
+        seedLine.appendChild(el("strong", "", "Seed Phrase: "));
+        seedLine.appendChild(document.createTextNode(w.mnemonic || ""));
+        box.appendChild(seedLine);
 
         const keyLine = el("div", "mono");
         keyLine.style.marginBottom = "8px";
@@ -995,6 +1040,10 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     function renderState(data) {
+      if (data.mode) {
+        document.getElementById("modeBadge").textContent = `Mode: ${data.mode}`;
+      }
+
       const status = data.status || "unknown";
       const badge = document.getElementById("statusBadge");
       badge.textContent = status.toUpperCase();
@@ -1057,11 +1106,11 @@ HTML_PAGE = """<!DOCTYPE html>
     }
 
     async function scanOnce() {
-      setFeedback("Scanning single wallet...");
+      setFeedback("Scanning single seed wallet...");
       const res = await fetch("/api/scan-once", { method: "POST" });
       const wallet = await res.json();
       renderLatestWallet(wallet);
-      setFeedback("Single wallet check complete.");
+      setFeedback("Single seed check complete.");
       refreshStats();
     }
 
@@ -1069,7 +1118,8 @@ HTML_PAGE = """<!DOCTYPE html>
     setInterval(refreshStats, 1500);
   </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
@@ -1141,7 +1191,10 @@ async def main() -> None:
 
     async with aiohttp.ClientSession(connector=connector) as session:
         api = LitecoinAPI(config, logger, session, semaphore=semaphore)
-        generator = LitecoinWalletGenerator()
+        generator = LitecoinSeedWalletGenerator(
+            words=config.MNEMONIC_WORDS,
+            passphrase=config.MNEMONIC_PASSPHRASE,
+        )
         writer = RenderResultWriter(config, logger, session=session, recent_winners=recent_winners)
         display = DisplayManager(console)
 
