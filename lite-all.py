@@ -17,7 +17,7 @@ from typing import Optional
 
 import aiohttp
 from aiohttp import web
-from libcrypto import HDWallet, Wallet, generate_mnemonic
+from libcrypto import HDWallet, Wallet
 from rich import box
 from rich.console import Console
 from rich.layout import Layout
@@ -36,6 +36,11 @@ except ImportError:
         return _json_lib.loads(raw)
 
 
+DEFAULT_CANDIDATE_SEEDS: list[str] = [
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════
@@ -49,13 +54,17 @@ class Config:
     API_RETRY_ATTEMPTS: int = 2
     API_RETRY_DELAY: float = 0.25
 
-    # Seed / Mnemonic Settings
-    MNEMONIC_WORDS: int = 12  # 12, 15, 18, 21, or 24
-    MNEMONIC_PASSPHRASE: str = ""
+    # Candidate Seed Settings
+    CANDIDATE_SEEDS_FILE: Optional[Path] = field(
+        default_factory=lambda: Path(p) if (p := os.environ.get("CANDIDATE_SEEDS_FILE", "").strip()) else None
+    )
+    MNEMONIC_PASSPHRASE: str = field(
+        default_factory=lambda: os.environ.get("MNEMONIC_PASSPHRASE", "")
+    )
 
     # Pipeline & Concurrency Settings
-    WORKERS: int = 32
-    MAX_CONCURRENT_REQUESTS: int = 64
+    WORKERS: int = 16
+    MAX_CONCURRENT_REQUESTS: int = 32
     REQUEST_DELAY: float = 0.0
 
     # Render / HTTP Port Binding & Winner Delivery
@@ -82,6 +91,8 @@ class Config:
         out = Path(self.OUTPUT_DIR)
         object.__setattr__(self, "OUTPUT_DIR", out)
         out.mkdir(parents=True, exist_ok=True)
+        if self.CANDIDATE_SEEDS_FILE is not None:
+            object.__setattr__(self, "CANDIDATE_SEEDS_FILE", Path(self.CANDIDATE_SEEDS_FILE))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,7 +136,7 @@ class WalletAddress:
 
 @dataclass(slots=True)
 class GeneratedWallet:
-    """Represents a complete generated wallet derived from a mnemonic seed."""
+    """Represents a complete generated wallet derived from a candidate seed."""
 
     mnemonic: str
     private_key: str
@@ -306,12 +317,14 @@ class LitecoinAPI(IBlockchainAPI):
             return {"balance": 0, "error": True}
 
 
-class LitecoinSeedWalletGenerator(IWalletGenerator):
-    """Generates BIP39 mnemonic seeds and derives Litecoin wallets/addresses."""
+class CandidateSeedWalletGenerator(IWalletGenerator):
+    """Derives Litecoin wallets from a list of candidate seed phrases."""
 
-    def __init__(self, words: int = 12, passphrase: str = "") -> None:
-        self._words = words
+    def __init__(self, candidates: list[str], passphrase: str = "") -> None:
+        cleaned = [c.strip() for c in candidates if c and c.strip()]
+        self._candidates = cleaned if cleaned else list(DEFAULT_CANDIDATE_SEEDS)
         self._passphrase = passphrase
+        self._index = 0
 
     def _private_key_from_mnemonic(self, mnemonic: str) -> str:
         try:
@@ -333,7 +346,8 @@ class LitecoinSeedWalletGenerator(IWalletGenerator):
         return seed_bytes.hex()
 
     def generate(self) -> GeneratedWallet:
-        mnemonic = generate_mnemonic(self._words)
+        mnemonic = self._candidates[self._index % len(self._candidates)]
+        self._index += 1
         private_key = self._private_key_from_mnemonic(mnemonic)
         wallet = Wallet(private_key)
 
@@ -350,6 +364,16 @@ class LitecoinSeedWalletGenerator(IWalletGenerator):
             private_key=private_key,
             addresses=addresses,
         )
+
+
+def load_candidate_seeds(config: Config) -> list[str]:
+    """Loads candidate seed phrases from file if configured, else returns defaults."""
+    if config.CANDIDATE_SEEDS_FILE and config.CANDIDATE_SEEDS_FILE.exists():
+        lines = config.CANDIDATE_SEEDS_FILE.read_text(encoding="utf-8").splitlines()
+        seeds = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+        if seeds:
+            return seeds
+    return list(DEFAULT_CANDIDATE_SEEDS)
 
 
 class RenderResultWriter(IResultWriter):
@@ -478,7 +502,7 @@ class DisplayManager:
 
     def _create_title(self, stats: ScannerStats) -> str:
         return (
-            f"[bold gold1]Litecoin Seed Scanner[/] | "
+            f"[bold gold1]Litecoin Candidate Scanner[/] | "
             f"[cyan]Scan #{stats.total_scanned:,}[/] | "
             f"[green]Winners: {stats.winners_found}[/]"
         )
@@ -486,9 +510,9 @@ class DisplayManager:
     def print_banner(self) -> None:
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
-║[/][bold gold1]          LITECOIN SEED SCANNER - PRO EDITION              [/][bold cyan]║
+║[/][bold gold1]       LITECOIN CANDIDATE SEED SCANNER - PRO EDITION        [/][bold cyan]║
 ║══════════════════════════════════════════════════════════════════║
-║[/]  [dim]BIP39 Seed Generator & Litecoin Balance Checker[/]            [bold cyan]║
+║[/]  [dim]Targeted Candidate Seed & Litecoin Balance Checker[/]         [bold cyan]║
 ║[/]  [dim]Press Ctrl+C to stop scanning gracefully[/]                     [bold cyan]║
 ╚══════════════════════════════════════════════════════════════════╝[/]
 """
@@ -500,7 +524,7 @@ class DisplayManager:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LitecoinScanner:
-    """Concurrent pipelined seed scanner orchestrator with live runtime controls."""
+    """Concurrent pipelined candidate seed scanner with live runtime controls."""
 
     def __init__(
         self,
@@ -543,7 +567,7 @@ class LitecoinScanner:
         return {
             "status": "stopped" if not self._running else ("paused" if self._paused else "running"),
             "paused": self._paused,
-            "mode": f"seed-{self._config.MNEMONIC_WORDS}w",
+            "mode": "candidate-seeds",
             "workers": self._workers_target,
             "max_concurrent_requests": self._semaphore.limit,
             "request_delay": self._request_delay,
@@ -685,8 +709,7 @@ class LitecoinScanner:
                     ui_task.cancel()
             else:
                 print(
-                    f"Running seed scanner ({self._config.MNEMONIC_WORDS}w) on "
-                    f"{self._config.HOST}:{self._config.PORT} "
+                    f"Running candidate seed scanner on {self._config.HOST}:{self._config.PORT} "
                     f"(webhook={'ON' if self._config.WINNER_WEBHOOK_URL else 'OFF'})",
                     flush=True,
                 )
@@ -738,7 +761,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Litecoin Seed Scanner Panel</title>
+  <title>Litecoin Candidate Seed Scanner Panel</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -871,9 +894,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Litecoin Seed Scanner Panel</h1>
+      <h1>Litecoin Candidate Seed Scanner Panel</h1>
       <div>
-        <span id="modeBadge" class="badge">Seed Mode</span>
+        <span id="modeBadge" class="badge">Candidate Seeds</span>
         <span id="webhookBadge" class="badge">Webhook: checking...</span>
         <span id="statusBadge" class="badge">Loading...</span>
       </div>
@@ -890,7 +913,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="card">
       <div class="controls">
         <button id="toggleBtn" onclick="toggleRun()">Pause</button>
-        <button class="secondary" onclick="scanOnce()">Scan 1 Seed Now</button>
+        <button class="secondary" onclick="scanOnce()">Scan 1 Candidate Now</button>
         <div class="field">
           <label for="workersInput">Workers</label>
           <input id="workersInput" type="number" min="1" max="256" step="1" />
@@ -914,7 +937,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <div class="label">Latest Checked Seed Wallet (<span id="latestTime">-</span>)</div>
+      <div class="label">Latest Checked Candidate (<span id="latestTime">-</span>)</div>
       <table>
         <thead>
           <tr>
@@ -1062,8 +1085,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById("toggleBtn").textContent = data.paused ? "Resume" : "Pause";
 
       if (!inputsInitialized) {
-        document.getElementById("workersInput").value = data.workers ?? 32;
-        document.getElementById("concInput").value = data.max_concurrent_requests ?? 64;
+        document.getElementById("workersInput").value = data.workers ?? 16;
+        document.getElementById("concInput").value = data.max_concurrent_requests ?? 32;
         document.getElementById("delayInput").value = data.request_delay ?? 0;
         inputsInitialized = true;
       }
@@ -1106,11 +1129,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
 
     async function scanOnce() {
-      setFeedback("Scanning single seed wallet...");
+      setFeedback("Scanning single candidate...");
       const res = await fetch("/api/scan-once", { method: "POST" });
       const wallet = await res.json();
       renderLatestWallet(wallet);
-      setFeedback("Single seed check complete.");
+      setFeedback("Single candidate check complete.");
       refreshStats();
     }
 
@@ -1122,115 +1145,4 @@ HTML_PAGE = r"""<!DOCTYPE html>
 """
 
 
-async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
-    """Bind an HTTP server to 0.0.0.0:$PORT with an interactive HTML UI and control API."""
-
-    async def handle_index(_request: web.Request) -> web.Response:
-        return web.Response(text=HTML_PAGE, content_type="text/html", status=200)
-
-    async def handle_health(_request: web.Request) -> web.Response:
-        return web.Response(text="ok", status=200)
-
-    async def handle_stats(_request: web.Request) -> web.Response:
-        return web.json_response(scanner.runtime_info())
-
-    async def handle_toggle(_request: web.Request) -> web.Response:
-        info = await scanner.set_paused(not scanner._paused)
-        return web.json_response(info)
-
-    async def handle_config(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        info = await scanner.update_runtime_config(
-            workers=body.get("workers"),
-            max_concurrent_requests=body.get("max_concurrent_requests"),
-            request_delay=body.get("request_delay"),
-        )
-        return web.json_response(info)
-
-    async def handle_scan_once(_request: web.Request) -> web.Response:
-        result = await scanner.scan_once()
-        return web.json_response(result)
-
-    app = web.Application()
-    app.router.add_get("/", handle_index)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/stats", handle_stats)
-    app.router.add_post("/api/toggle", handle_toggle)
-    app.router.add_post("/api/config", handle_config)
-    app.router.add_post("/api/scan-once", handle_scan_once)
-
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, host=config.HOST, port=config.PORT)
-    await site.start()
-    return runner
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Application Entry Point
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def main() -> None:
-    config = Config()
-    console = Console()
-    logger = setup_logging(config)
-    semaphore = DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
-    recent_winners: deque[dict] = deque(maxlen=config.MAX_RECENT_WINNERS)
-
-    connector = aiohttp.TCPConnector(
-        limit=max(config.MAX_CONCURRENT_REQUESTS * 2, 128),
-        limit_per_host=0,
-        ttl_dns_cache=300,
-    )
-
-    runner: Optional[web.AppRunner] = None
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        api = LitecoinAPI(config, logger, session, semaphore=semaphore)
-        generator = LitecoinSeedWalletGenerator(
-            words=config.MNEMONIC_WORDS,
-            passphrase=config.MNEMONIC_PASSPHRASE,
-        )
-        writer = RenderResultWriter(config, logger, session=session, recent_winners=recent_winners)
-        display = DisplayManager(console)
-
-        scanner = LitecoinScanner(
-            config=config,
-            api=api,
-            generator=generator,
-            writer=writer,
-            display=display,
-            logger=logger,
-            console=console,
-            semaphore=semaphore,
-            recent_winners=recent_winners,
-        )
-
-        runner = await start_render_server(config, scanner)
-
-        loop = asyncio.get_running_loop()
-        if sys.platform != "win32":
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, scanner.stop)
-
-        try:
-            await scanner.run()
-        except KeyboardInterrupt:
-            scanner.stop()
-        finally:
-            if runner is not None:
-                await runner.cleanup()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nScanner terminated by user.")
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        sys.exit(1)
+async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner
