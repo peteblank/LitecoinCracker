@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiohttp
+from aiohttp import web
 from libcrypto import Wallet
 from rich import box
 from rich.console import Console
@@ -50,6 +51,11 @@ class Config:
     WORKERS: int = 32
     MAX_CONCURRENT_REQUESTS: int = 64
     REQUEST_DELAY: float = 0.0
+
+    # Render / HTTP Port Binding
+    HOST: str = "0.0.0.0"
+    PORT: int = field(default_factory=lambda: int(os.environ.get("PORT", "10000")))
+    STATUS_LOG_INTERVAL: float = 15.0
 
     # Output Configuration
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("output"))
@@ -128,7 +134,6 @@ class ScannerStats:
     total_scanned: int = 0
     winners_found: int = 0
     api_errors: int = 0
-    start_time: float = field(default_factory=asyncio.get_event_loop) if False else 0.0
     start_dt: datetime = field(default_factory=datetime.now)
 
     @property
@@ -338,15 +343,15 @@ class DisplayManager:
 
     def _create_title(self, stats: ScannerStats) -> str:
         return (
-            f"[bold gold1]⚡ Litecoin Scanner[/] │ "
-            f"[cyan]Scan #{stats.total_scanned:,}[/] │ "
+            f"[bold gold1]Litecoin Scanner[/] | "
+            f"[cyan]Scan #{stats.total_scanned:,}[/] | "
             f"[green]Winners: {stats.winners_found}[/]"
         )
 
     def print_banner(self) -> None:
         banner = """
 [bold cyan]╔══════════════════════════════════════════════════════════════════╗
-║[/][bold gold1]          ⚡ LITECOIN WALLET SCANNER - PRO EDITION ⚡            [/][bold cyan]║
+║[/][bold gold1]          LITECOIN WALLET SCANNER - PRO EDITION            [/][bold cyan]║
 ║══════════════════════════════════════════════════════════════════║
 ║[/]  [dim]High-Performance Address Generator & Balance Checker[/]         [bold cyan]║
 ║[/]  [dim]Press Ctrl+C to stop scanning gracefully[/]                     [bold cyan]║
@@ -382,6 +387,10 @@ class LitecoinScanner:
         self._stats = ScannerStats()
         self._running = True
         self._latest_wallet: Optional[GeneratedWallet] = None
+
+    @property
+    def stats(self) -> ScannerStats:
+        return self._stats
 
     async def _fetch_address_info(self, address: WalletAddress) -> None:
         try:
@@ -429,31 +438,66 @@ class LitecoinScanner:
             live.update(layout)
             await asyncio.sleep(interval)
 
+    async def _headless_status_loop(self) -> None:
+        while self._running:
+            await asyncio.sleep(self._config.STATUS_LOG_INTERVAL)
+            if not self._running:
+                break
+            print(
+                f"Scanned={self._stats.total_scanned:,} | "
+                f"Winners={self._stats.winners_found} | "
+                f"Rate={self._stats.scan_rate:.2f}/s | "
+                f"Errors={self._stats.api_errors} | "
+                f"Elapsed={self._stats.elapsed_time}",
+                flush=True,
+            )
+
     def stop(self) -> None:
         self._running = False
 
     async def run(self) -> None:
-        self._display.print_banner()
         workers = [asyncio.create_task(self._worker()) for _ in range(self._config.WORKERS)]
+        is_tty = sys.stdout.isatty()
 
         try:
-            with Live(
-                self._display.create_stats_panel(self._stats),
-                console=self._console,
-                refresh_per_second=self._config.REFRESH_PER_SECOND,
-                transient=True,
-            ) as live:
-                ui_task = asyncio.create_task(self._ui_loop(live))
+            if is_tty:
+                self._display.print_banner()
+                with Live(
+                    self._display.create_stats_panel(self._stats),
+                    console=self._console,
+                    refresh_per_second=self._config.REFRESH_PER_SECOND,
+                    transient=True,
+                ) as live:
+                    ui_task = asyncio.create_task(self._ui_loop(live))
+                    await asyncio.gather(*workers)
+                    ui_task.cancel()
+            else:
+                print(
+                    f"Running in headless mode on {self._config.HOST}:{self._config.PORT}",
+                    flush=True,
+                )
+                status_task = asyncio.create_task(self._headless_status_loop())
                 await asyncio.gather(*workers)
-                ui_task.cancel()
+                status_task.cancel()
         except asyncio.CancelledError:
             pass
         finally:
             self._running = False
             await asyncio.gather(*workers, return_exceptions=True)
-            self._print_summary()
+            self._print_summary(is_tty=is_tty)
 
-    def _print_summary(self) -> None:
+    def _print_summary(self, is_tty: bool = True) -> None:
+        if not is_tty:
+            print(
+                f"Scan complete | Scanned={self._stats.total_scanned:,} | "
+                f"Winners={self._stats.winners_found} | "
+                f"Errors={self._stats.api_errors} | "
+                f"Rate={self._stats.scan_rate:.2f}/s | "
+                f"Elapsed={self._stats.elapsed_time}",
+                flush=True,
+            )
+            return
+
         summary = f"""
 [bold green]╔══════════════════════════════════════════════════════════════════╗
 ║                        SCAN COMPLETE                             ║
@@ -466,6 +510,40 @@ class LitecoinScanner:
 ╚══════════════════════════════════════════════════════════════════╝[/]
 """
         self._console.print(summary)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Render HTTP Health / Status Server
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
+    """Bind an HTTP server to 0.0.0.0:$PORT for Render Web Service health checks."""
+
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.Response(text="ok", status=200)
+
+    async def handle_stats(_request: web.Request) -> web.Response:
+        s = scanner.stats
+        payload = {
+            "status": "running" if scanner._running else "stopping",
+            "total_scanned": s.total_scanned,
+            "winners_found": s.winners_found,
+            "api_errors": s.api_errors,
+            "scan_rate_per_sec": round(s.scan_rate, 2),
+            "elapsed": s.elapsed_time,
+        }
+        return web.json_response(payload)
+
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/stats", handle_stats)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host=config.HOST, port=config.PORT)
+    await site.start()
+    return runner
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -483,6 +561,8 @@ async def main() -> None:
         ttl_dns_cache=300,
     )
 
+    runner: Optional[web.AppRunner] = None
+
     async with aiohttp.ClientSession(connector=connector) as session:
         api = LitecoinAPI(config, logger, session)
         generator = LitecoinWalletGenerator()
@@ -499,6 +579,8 @@ async def main() -> None:
             console=console,
         )
 
+        runner = await start_render_server(config, scanner)
+
         loop = asyncio.get_running_loop()
         if sys.platform != "win32":
             for sig in (signal.SIGINT, signal.SIGTERM):
@@ -508,6 +590,9 @@ async def main() -> None:
             await scanner.run()
         except KeyboardInterrupt:
             scanner.stop()
+        finally:
+            if runner is not None:
+                await runner.cleanup()
 
 
 if __name__ == "__main__":
