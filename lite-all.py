@@ -695,7 +695,7 @@ class LitecoinScanner:
 # Render HTTP Server & Interactive HTML Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
-HTML_PAGE = """<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -963,3 +963,190 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById("concInput").value = data.max_concurrent_requests;
         document.getElementById("delayInput").value = data.request_delay;
         inputsInitialized = true;
+      }
+
+      renderWinners(data.recent_winners);
+
+      const tbody = document.getElementById("walletRows");
+      const latest = data.latest_wallet;
+      if (!latest || !latest.addresses || latest.addresses.length === 0) {
+        return;
+      }
+      document.getElementById("latestTime").textContent = latest.generated_at;
+      tbody.innerHTML = latest.addresses.map(a => `
+        <tr>
+          <td>${a.type}</td>
+          <td class="mono">${a.address}</td>
+          <td>${Number(a.balance).toLocaleString()}</td>
+          <td>${Number(a.tx_count).toLocaleString()}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function refreshStats() {
+      try {
+        const res = await fetch("/stats", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        renderState(data);
+      } catch (_) {}
+    }
+
+    async function toggleRun() {
+      const res = await fetch("/api/toggle", { method: "POST" });
+      const data = await res.json();
+      renderState(data);
+      setFeedback(data.paused ? "Scanner paused." : "Scanner resumed.");
+    }
+
+    async function saveConfig() {
+      const payload = {
+        workers: Number(document.getElementById("workersInput").value),
+        max_concurrent_requests: Number(document.getElementById("concInput").value),
+        request_delay: Number(document.getElementById("delayInput").value),
+      };
+      const res = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      inputsInitialized = false;
+      renderState(data);
+      setFeedback("Settings updated.");
+    }
+
+    async function scanOnce() {
+      setFeedback("Scanning single wallet...");
+      const res = await fetch("/api/scan-once", { method: "POST" });
+      const wallet = await res.json();
+      document.getElementById("latestTime").textContent = wallet.generated_at;
+      document.getElementById("walletRows").innerHTML = wallet.addresses.map(a => `
+        <tr>
+          <td>${a.type}</td>
+          <td class="mono">${a.address}</td>
+          <td>${Number(a.balance).toLocaleString()}</td>
+          <td>${Number(a.tx_count).toLocaleString()}</td>
+        </tr>
+      `).join("");
+      setFeedback("Single wallet check complete.");
+      refreshStats();
+    }
+
+    refreshStats();
+    setInterval(refreshStats, 1500);
+  </script>
+</body>
+</html>
+"""
+
+
+async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
+    """Bind an HTTP server to 0.0.0.0:$PORT with an interactive HTML UI and control API."""
+
+    async def handle_index(_request: web.Request) -> web.Response:
+        return web.Response(text=HTML_PAGE, content_type="text/html", status=200)
+
+    async def handle_health(_request: web.Request) -> web.Response:
+        return web.Response(text="ok", status=200)
+
+    async def handle_stats(_request: web.Request) -> web.Response:
+        return web.json_response(scanner.runtime_info())
+
+    async def handle_toggle(_request: web.Request) -> web.Response:
+        info = await scanner.set_paused(not scanner._paused)
+        return web.json_response(info)
+
+    async def handle_config(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        info = await scanner.update_runtime_config(
+            workers=body.get("workers"),
+            max_concurrent_requests=body.get("max_concurrent_requests"),
+            request_delay=body.get("request_delay"),
+        )
+        return web.json_response(info)
+
+    async def handle_scan_once(_request: web.Request) -> web.Response:
+        result = await scanner.scan_once()
+        return web.json_response(result)
+
+    app = web.Application()
+    app.router.add_get("/", handle_index)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/stats", handle_stats)
+    app.router.add_post("/api/toggle", handle_toggle)
+    app.router.add_post("/api/config", handle_config)
+    app.router.add_post("/api/scan-once", handle_scan_once)
+
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    site = web.TCPSite(runner, host=config.HOST, port=config.PORT)
+    await site.start()
+    return runner
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Application Entry Point
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def main() -> None:
+    config = Config()
+    console = Console()
+    logger = setup_logging(config)
+    semaphore = DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
+    recent_winners: deque[dict] = deque(maxlen=config.MAX_RECENT_WINNERS)
+
+    connector = aiohttp.TCPConnector(
+        limit=max(config.MAX_CONCURRENT_REQUESTS * 2, 128),
+        limit_per_host=0,
+        ttl_dns_cache=300,
+    )
+
+    runner: Optional[web.AppRunner] = None
+
+    async with aiohttp.ClientSession(connector=connector) as session:
+        api = LitecoinAPI(config, logger, session, semaphore=semaphore)
+        generator = LitecoinWalletGenerator()
+        writer = RenderResultWriter(config, logger, session=session, recent_winners=recent_winners)
+        display = DisplayManager(console)
+
+        scanner = LitecoinScanner(
+            config=config,
+            api=api,
+            generator=generator,
+            writer=writer,
+            display=display,
+            logger=logger,
+            console=console,
+            semaphore=semaphore,
+            recent_winners=recent_winners,
+        )
+
+        runner = await start_render_server(config, scanner)
+
+        loop = asyncio.get_running_loop()
+        if sys.platform != "win32":
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                loop.add_signal_handler(sig, scanner.stop)
+
+        try:
+            await scanner.run()
+        except KeyboardInterrupt:
+            scanner.stop()
+        finally:
+            if runner is not None:
+                await runner.cleanup()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nScanner terminated by user.")
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
