@@ -380,13 +380,26 @@ class CandidateSeedWalletGenerator(IWalletGenerator):
 
 
 def load_candidate_seeds(config: Config) -> list[str]:
-    """Loads candidate seed phrases from file if configured, else returns defaults."""
-    if config.CANDIDATE_SEEDS_FILE and config.CANDIDATE_SEEDS_FILE.exists():
-        lines = config.CANDIDATE_SEEDS_FILE.read_text(encoding="utf-8").splitlines()
-        seeds = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
+    """Loads candidate seed phrases from output.txt (or CANDIDATE_SEEDS_FILE), falling back to defaults."""
+    seed_path = config.CANDIDATE_SEEDS_FILE or (Path(__file__).resolve().parent / "output.txt")
+    if not seed_path.is_absolute():
+        seed_path = Path(__file__).resolve().parent / seed_path
+
+    if seed_path.exists():
+        lines = seed_path.read_text(encoding="utf-8").splitlines()
+        seeds = [
+            line.strip()
+            for line in lines
+            if line.strip() and not line.strip().startswith("#")
+        ]
         if seeds:
             return seeds
-    return list(DEFAULT_CANDIDATE_SEEDS)
+
+    fallback = [s.strip() for s in DEFAULT_CANDIDATE_SEEDS if s and s.strip()]
+    if fallback:
+        return fallback
+
+    raise ValueError(f"No valid candidate seeds found in {seed_path} or DEFAULT_CANDIDATE_SEEDS.")
 
 
 class RenderResultWriter(IResultWriter):
