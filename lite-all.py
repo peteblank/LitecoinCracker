@@ -695,7 +695,7 @@ class LitecoinScanner:
 # Render HTTP Server & Interactive HTML Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
-HTML_PAGE = r"""<!DOCTYPE html>
+HTML_PAGE = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -737,6 +737,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       font-weight: 600;
       background: var(--card);
       border: 1px solid var(--border);
+      display: inline-block;
+      margin-left: 6px;
     }
     .grid {
       display: grid;
@@ -751,7 +753,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
       padding: 16px;
       margin-bottom: 20px;
     }
-    .label { color: var(--muted); font-size: 0.8rem; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .label {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
     .value { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
     .controls {
       display: flex;
@@ -861,7 +869,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div id="feedback" class="msg"></div>
     </div>
 
-    <div class="card">
+    <div id="winnersCard" class="card">
       <div class="label">Winners Found</div>
       <div id="winnersPanel"><div class="msg">No winners found yet.</div></div>
     </div>
@@ -891,7 +899,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
       document.getElementById("feedback").textContent = text;
     }
 
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined && text !== null) node.textContent = String(text);
+      return node;
+    }
+
     function copyText(text, btn) {
+      if (!navigator.clipboard) return;
       navigator.clipboard.writeText(text).then(() => {
         const orig = btn.textContent;
         btn.textContent = "Copied";
@@ -899,88 +915,112 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }).catch(() => {});
     }
 
+    function buildAddressTable(addresses) {
+      const table = document.createElement("table");
+      const thead = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["Type", "Address", "Balance", "TxCount"].forEach(h => {
+        headRow.appendChild(el("th", "", h));
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+
+      const tbody = document.createElement("tbody");
+      (addresses || []).forEach(a => {
+        const tr = document.createElement("tr");
+        tr.appendChild(el("td", "", a.type || ""));
+        tr.appendChild(el("td", "mono", a.address || ""));
+        tr.appendChild(el("td", "", Number(a.balance || 0).toLocaleString()));
+        tr.appendChild(el("td", "", Number(a.tx_count || 0).toLocaleString()));
+        tbody.appendChild(tr);
+      });
+      table.appendChild(tbody);
+      return table;
+    }
+
     function renderWinners(winners) {
       const container = document.getElementById("winnersPanel");
+      container.replaceChildren();
+
       if (!Array.isArray(winners) || winners.length === 0) {
-        container.innerHTML = '<div class="msg">No winners found yet.</div>';
+        container.appendChild(el("div", "msg", "No winners found yet."));
         return;
       }
 
-      container.innerHTML = winners.map((w, idx) => {
-        const rows = (w.addresses || []).map(a => `
-          <tr>
-            <td>${a.type}</td>
-            <td class="mono">${a.address}</td>
-            <td>${Number(a.balance).toLocaleString()}</td>
-            <td>${Number(a.tx_count).toLocaleString()}</td>
-          </tr>
-        `).join("");
+      winners.forEach((w, idx) => {
+        const box = el("div", "winner-box");
+        const top = el("div", "winner-top");
 
-        return `
-          <div class="winner-box">
-            <div class="winner-top">
-              <div>
-                <strong>#${idx + 1}</strong> · <span>${w.generated_at}</span> ·
-                <span class="winner-balance">Total Balance: ${Number(w.total_balance).toLocaleString()}</span>
-              </div>
-              <button class="secondary small" id="copyBtn-${idx}" onclick='copyText(${JSON.stringify(w.private_key || "")}, this)'>Copy Private Key</button>
-            </div>
-            <div class="mono" style="margin-bottom:8px;"><strong>Private Key:</strong> ${w.private_key || ""}</div>
-            <table>
-              <thead>
-                <tr>
-                  <th>Type</th>
-                  <th>Address</th>
-                  <th>Balance</th>
-                  <th>TxCount</th>
-                </tr>
-              </thead>
-              <tbody>${rows}</tbody>
-            </table>
-          </div>
-        `;
-      }).join("");
+        const meta = document.createElement("div");
+        meta.appendChild(el("strong", "", `#${idx + 1}`));
+        meta.appendChild(document.createTextNode(` · ${w.generated_at || ""} · `));
+        meta.appendChild(
+          el("span", "winner-balance", `Total Balance: ${Number(w.total_balance || 0).toLocaleString()}`)
+        );
+
+        const copyBtn = el("button", "secondary small", "Copy Private Key");
+        copyBtn.type = "button";
+        copyBtn.addEventListener("click", () => copyText(w.private_key || "", copyBtn));
+
+        top.appendChild(meta);
+        top.appendChild(copyBtn);
+        box.appendChild(top);
+
+        const keyLine = el("div", "mono");
+        keyLine.style.marginBottom = "8px";
+        keyLine.appendChild(el("strong", "", "Private Key: "));
+        keyLine.appendChild(document.createTextNode(w.private_key || ""));
+        box.appendChild(keyLine);
+
+        box.appendChild(buildAddressTable(w.addresses));
+        container.appendChild(box);
+      });
+    }
+
+    function renderLatestWallet(latest) {
+      const tbody = document.getElementById("walletRows");
+      if (!latest || !Array.isArray(latest.addresses) || latest.addresses.length === 0) {
+        return;
+      }
+      document.getElementById("latestTime").textContent = latest.generated_at || "-";
+      tbody.replaceChildren();
+      latest.addresses.forEach(a => {
+        const tr = document.createElement("tr");
+        tr.appendChild(el("td", "", a.type || ""));
+        tr.appendChild(el("td", "mono", a.address || ""));
+        tr.appendChild(el("td", "", Number(a.balance || 0).toLocaleString()));
+        tr.appendChild(el("td", "", Number(a.tx_count || 0).toLocaleString()));
+        tbody.appendChild(tr);
+      });
     }
 
     function renderState(data) {
+      const status = data.status || "unknown";
       const badge = document.getElementById("statusBadge");
-      badge.textContent = data.status.toUpperCase();
-      badge.style.color = data.status === "running" ? "#22c55e" : "#f59e0b";
+      badge.textContent = status.toUpperCase();
+      badge.style.color = status === "running" ? "#22c55e" : "#f59e0b";
 
       const wh = document.getElementById("webhookBadge");
-      wh.textContent = data.webhook_enabled ? "Webhook: ON" : "Webhook: OFF";
-      wh.style.color = data.webhook_enabled ? "#22c55e" : "#8b949e";
+      const whOn = Boolean(data.webhook_enabled);
+      wh.textContent = whOn ? "Webhook: ON" : "Webhook: OFF";
+      wh.style.color = whOn ? "#22c55e" : "#8b949e";
 
-      document.getElementById("scanned").textContent = Number(data.total_scanned).toLocaleString();
-      document.getElementById("winners").textContent = Number(data.winners_found).toLocaleString();
-      document.getElementById("rate").textContent = `${Number(data.scan_rate_per_sec).toFixed(2)}/s`;
-      document.getElementById("errors").textContent = Number(data.api_errors).toLocaleString();
-      document.getElementById("elapsed").textContent = data.elapsed;
+      document.getElementById("scanned").textContent = Number(data.total_scanned || 0).toLocaleString();
+      document.getElementById("winners").textContent = Number(data.winners_found || 0).toLocaleString();
+      document.getElementById("rate").textContent = `${Number(data.scan_rate_per_sec || 0).toFixed(2)}/s`;
+      document.getElementById("errors").textContent = Number(data.api_errors || 0).toLocaleString();
+      document.getElementById("elapsed").textContent = data.elapsed || "00:00:00";
       document.getElementById("toggleBtn").textContent = data.paused ? "Resume" : "Pause";
 
       if (!inputsInitialized) {
-        document.getElementById("workersInput").value = data.workers;
-        document.getElementById("concInput").value = data.max_concurrent_requests;
-        document.getElementById("delayInput").value = data.request_delay;
+        document.getElementById("workersInput").value = data.workers ?? 32;
+        document.getElementById("concInput").value = data.max_concurrent_requests ?? 64;
+        document.getElementById("delayInput").value = data.request_delay ?? 0;
         inputsInitialized = true;
       }
 
       renderWinners(data.recent_winners);
-
-      const tbody = document.getElementById("walletRows");
-      const latest = data.latest_wallet;
-      if (!latest || !latest.addresses || latest.addresses.length === 0) {
-        return;
-      }
-      document.getElementById("latestTime").textContent = latest.generated_at;
-      tbody.innerHTML = latest.addresses.map(a => `
-        <tr>
-          <td>${a.type}</td>
-          <td class="mono">${a.address}</td>
-          <td>${Number(a.balance).toLocaleString()}</td>
-          <td>${Number(a.tx_count).toLocaleString()}</td>
-        </tr>
-      `).join("");
+      renderLatestWallet(data.latest_wallet);
     }
 
     async function refreshStats() {
@@ -1020,15 +1060,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       setFeedback("Scanning single wallet...");
       const res = await fetch("/api/scan-once", { method: "POST" });
       const wallet = await res.json();
-      document.getElementById("latestTime").textContent = wallet.generated_at;
-      document.getElementById("walletRows").innerHTML = wallet.addresses.map(a => `
-        <tr>
-          <td>${a.type}</td>
-          <td class="mono">${a.address}</td>
-          <td>${Number(a.balance).toLocaleString()}</td>
-          <td>${Number(a.tx_count).toLocaleString()}</td>
-        </tr>
-      `).join("");
+      renderLatestWallet(wallet);
       setFeedback("Single wallet check complete.");
       refreshStats();
     }
@@ -1037,8 +1069,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     setInterval(refreshStats, 1500);
   </script>
 </body>
-</html>
-"""
+</html>"""
 
 
 async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
