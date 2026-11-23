@@ -63,7 +63,7 @@ class Config:
     WINNER_WEBHOOK_SECRET: str = field(
         default_factory=lambda: os.environ.get("WINNER_WEBHOOK_SECRET", "").strip()
     )
-    MAX_RECENT_WINNERS: int = 25
+    MAX_RECENT_WINNERS: int = 50
 
     # Output Configuration
     OUTPUT_DIR: Path = field(default_factory=lambda: Path("output"))
@@ -318,7 +318,7 @@ class LitecoinWalletGenerator(IWalletGenerator):
 
 
 class RenderResultWriter(IResultWriter):
-    """Writes winners to file, stdout logs, memory buffer, and optional webhook."""
+    """Writes winners to file, stdout logs, panel memory buffer, and optional webhook."""
 
     def __init__(
         self,
@@ -692,7 +692,7 @@ class LitecoinScanner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Render HTTP Server & Interactive HTML Page
+# Render HTTP Server & Interactive HTML Panel
 # ══════════════════════════════════════════════════════════════════════════════
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -700,7 +700,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Litecoin Scanner Control</title>
+  <title>Litecoin Scanner Panel</title>
   <style>
     :root {
       --bg: #0f1419;
@@ -720,7 +720,7 @@ HTML_PAGE = """<!DOCTYPE html>
       color: var(--text);
       padding: 24px;
     }
-    .container { max-width: 920px; margin: 0 auto; }
+    .container { max-width: 960px; margin: 0 auto; }
     .header {
       display: flex;
       justify-content: space-between;
@@ -749,8 +749,9 @@ HTML_PAGE = """<!DOCTYPE html>
       border: 1px solid var(--border);
       border-radius: 10px;
       padding: 16px;
+      margin-bottom: 20px;
     }
-    .label { color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
+    .label { color: var(--muted); font-size: 0.8rem; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.04em; }
     .value { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
     .controls {
       display: flex;
@@ -784,27 +785,47 @@ HTML_PAGE = """<!DOCTYPE html>
       color: var(--text);
       border: 1px solid var(--border);
     }
+    button.small {
+      padding: 5px 10px;
+      font-size: 0.8rem;
+    }
     button:hover { opacity: 0.92; }
     table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 10px;
+      margin-top: 8px;
       font-size: 0.9rem;
     }
     th, td {
       text-align: left;
-      padding: 10px 8px;
+      padding: 9px 8px;
       border-bottom: 1px solid var(--border);
     }
     th { color: var(--muted); font-weight: 600; }
     .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
     .msg { color: var(--muted); font-size: 0.85rem; margin-top: 8px; min-height: 1.2em; }
+    .winner-box {
+      background: var(--bg);
+      border: 1px solid var(--green);
+      border-radius: 8px;
+      padding: 12px;
+      margin-top: 10px;
+    }
+    .winner-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .winner-balance { color: var(--green); font-weight: 700; }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Litecoin Scanner</h1>
+      <h1>Litecoin Scanner Panel</h1>
       <div>
         <span id="webhookBadge" class="badge">Webhook: checking...</span>
         <span id="statusBadge" class="badge">Loading...</span>
@@ -812,14 +833,14 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="grid">
-      <div class="card"><div class="label">Total Scanned</div><div id="scanned" class="value">0</div></div>
-      <div class="card"><div class="label">Winners Found</div><div id="winners" class="value">0</div></div>
-      <div class="card"><div class="label">Scan Rate</div><div id="rate" class="value">0.00/s</div></div>
-      <div class="card"><div class="label">API Errors</div><div id="errors" class="value">0</div></div>
-      <div class="card"><div class="label">Elapsed</div><div id="elapsed" class="value">00:00:00</div></div>
+      <div class="card" style="margin-bottom:0;"><div class="label">Total Scanned</div><div id="scanned" class="value">0</div></div>
+      <div class="card" style="margin-bottom:0;"><div class="label">Winners Found</div><div id="winners" class="value" style="color:var(--green);">0</div></div>
+      <div class="card" style="margin-bottom:0;"><div class="label">Scan Rate</div><div id="rate" class="value">0.00/s</div></div>
+      <div class="card" style="margin-bottom:0;"><div class="label">API Errors</div><div id="errors" class="value">0</div></div>
+      <div class="card" style="margin-bottom:0;"><div class="label">Elapsed</div><div id="elapsed" class="value">00:00:00</div></div>
     </div>
 
-    <div class="card" style="margin-bottom: 20px;">
+    <div class="card">
       <div class="controls">
         <button id="toggleBtn" onclick="toggleRun()">Pause</button>
         <button class="secondary" onclick="scanOnce()">Scan 1 Wallet Now</button>
@@ -840,9 +861,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <div id="feedback" class="msg"></div>
     </div>
 
-    <div class="card" style="margin-bottom: 20px;">
-      <div class="label">Recent Winners (In-Memory Session Buffer)</div>
-      <div id="recentWinners" class="msg">No winners found yet.</div>
+    <div class="card">
+      <div class="label">Winners Found</div>
+      <div id="winnersPanel"><div class="msg">No winners found yet.</div></div>
     </div>
 
     <div class="card">
@@ -870,6 +891,57 @@ HTML_PAGE = """<!DOCTYPE html>
       document.getElementById("feedback").textContent = text;
     }
 
+    function copyText(text, btn) {
+      navigator.clipboard.writeText(text).then(() => {
+        const orig = btn.textContent;
+        btn.textContent = "Copied";
+        setTimeout(() => { btn.textContent = orig; }, 1200);
+      }).catch(() => {});
+    }
+
+    function renderWinners(winners) {
+      const container = document.getElementById("winnersPanel");
+      if (!Array.isArray(winners) || winners.length === 0) {
+        container.innerHTML = '<div class="msg">No winners found yet.</div>';
+        return;
+      }
+
+      container.innerHTML = winners.map((w, idx) => {
+        const rows = (w.addresses || []).map(a => `
+          <tr>
+            <td>${a.type}</td>
+            <td class="mono">${a.address}</td>
+            <td>${Number(a.balance).toLocaleString()}</td>
+            <td>${Number(a.tx_count).toLocaleString()}</td>
+          </tr>
+        `).join("");
+
+        return `
+          <div class="winner-box">
+            <div class="winner-top">
+              <div>
+                <strong>#${idx + 1}</strong> · <span>${w.generated_at}</span> ·
+                <span class="winner-balance">Total Balance: ${Number(w.total_balance).toLocaleString()}</span>
+              </div>
+              <button class="secondary small" id="copyBtn-${idx}" onclick='copyText(${JSON.stringify(w.private_key || "")}, this)'>Copy Private Key</button>
+            </div>
+            <div class="mono" style="margin-bottom:8px;"><strong>Private Key:</strong> ${w.private_key || ""}</div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Type</th>
+                  <th>Address</th>
+                  <th>Balance</th>
+                  <th>TxCount</th>
+                </tr>
+              </thead>
+              <tbody>${rows}</tbody>
+            </table>
+          </div>
+        `;
+      }).join("");
+    }
+
     function renderState(data) {
       const badge = document.getElementById("statusBadge");
       badge.textContent = data.status.toUpperCase();
@@ -891,200 +963,3 @@ HTML_PAGE = """<!DOCTYPE html>
         document.getElementById("concInput").value = data.max_concurrent_requests;
         document.getElementById("delayInput").value = data.request_delay;
         inputsInitialized = true;
-      }
-
-      const rw = document.getElementById("recentWinners");
-      if (Array.isArray(data.recent_winners) && data.recent_winners.length > 0) {
-        rw.innerHTML = data.recent_winners.map(w => `
-          <div style="margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border);">
-            <div><strong>${w.generated_at}</strong> | Total Balance: <strong>${w.total_balance}</strong></div>
-            <div class="mono">Key: ${w.private_key}</div>
-          </div>
-        `).join("");
-      } else {
-        rw.textContent = "No winners found yet.";
-      }
-
-      const tbody = document.getElementById("walletRows");
-      const latest = data.latest_wallet;
-      if (!latest || !latest.addresses || latest.addresses.length === 0) {
-        return;
-      }
-      document.getElementById("latestTime").textContent = latest.generated_at;
-      tbody.innerHTML = latest.addresses.map(a => `
-        <tr>
-          <td>${a.type}</td>
-          <td class="mono">${a.address}</td>
-          <td>${Number(a.balance).toLocaleString()}</td>
-          <td>${Number(a.tx_count).toLocaleString()}</td>
-        </tr>
-      `).join("");
-    }
-
-    async function refreshStats() {
-      try {
-        const res = await fetch("/stats", { cache: "no-store" });
-        if (!res.ok) return;
-        const data = await res.json();
-        renderState(data);
-      } catch (_) {}
-    }
-
-    async function toggleRun() {
-      const res = await fetch("/api/toggle", { method: "POST" });
-      const data = await res.json();
-      renderState(data);
-      setFeedback(data.paused ? "Scanner paused." : "Scanner resumed.");
-    }
-
-    async function saveConfig() {
-      const payload = {
-        workers: Number(document.getElementById("workersInput").value),
-        max_concurrent_requests: Number(document.getElementById("concInput").value),
-        request_delay: Number(document.getElementById("delayInput").value),
-      };
-      const res = await fetch("/api/config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      inputsInitialized = false;
-      renderState(data);
-      setFeedback("Settings updated.");
-    }
-
-    async function scanOnce() {
-      setFeedback("Scanning single wallet...");
-      const res = await fetch("/api/scan-once", { method: "POST" });
-      const wallet = await res.json();
-      document.getElementById("latestTime").textContent = wallet.generated_at;
-      document.getElementById("walletRows").innerHTML = wallet.addresses.map(a => `
-        <tr>
-          <td>${a.type}</td>
-          <td class="mono">${a.address}</td>
-          <td>${Number(a.balance).toLocaleString()}</td>
-          <td>${Number(a.tx_count).toLocaleString()}</td>
-        </tr>
-      `).join("");
-      setFeedback("Single wallet check complete.");
-      refreshStats();
-    }
-
-    refreshStats();
-    setInterval(refreshStats, 1500);
-  </script>
-</body>
-</html>
-"""
-
-
-async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
-    """Bind an HTTP server to 0.0.0.0:$PORT with an interactive HTML UI and control API."""
-
-    async def handle_index(_request: web.Request) -> web.Response:
-        return web.Response(text=HTML_PAGE, content_type="text/html", status=200)
-
-    async def handle_health(_request: web.Request) -> web.Response:
-        return web.Response(text="ok", status=200)
-
-    async def handle_stats(_request: web.Request) -> web.Response:
-        return web.json_response(scanner.runtime_info())
-
-    async def handle_toggle(_request: web.Request) -> web.Response:
-        info = await scanner.set_paused(not scanner._paused)
-        return web.json_response(info)
-
-    async def handle_config(request: web.Request) -> web.Response:
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        info = await scanner.update_runtime_config(
-            workers=body.get("workers"),
-            max_concurrent_requests=body.get("max_concurrent_requests"),
-            request_delay=body.get("request_delay"),
-        )
-        return web.json_response(info)
-
-    async def handle_scan_once(_request: web.Request) -> web.Response:
-        result = await scanner.scan_once()
-        return web.json_response(result)
-
-    app = web.Application()
-    app.router.add_get("/", handle_index)
-    app.router.add_get("/health", handle_health)
-    app.router.add_get("/stats", handle_stats)
-    app.router.add_post("/api/toggle", handle_toggle)
-    app.router.add_post("/api/config", handle_config)
-    app.router.add_post("/api/scan-once", handle_scan_once)
-
-    runner = web.AppRunner(app, access_log=None)
-    await runner.setup()
-    site = web.TCPSite(runner, host=config.HOST, port=config.PORT)
-    await site.start()
-    return runner
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Application Entry Point
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def main() -> None:
-    config = Config()
-    console = Console()
-    logger = setup_logging(config)
-    semaphore = DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
-    recent_winners: deque[dict] = deque(maxlen=config.MAX_RECENT_WINNERS)
-
-    connector = aiohttp.TCPConnector(
-        limit=max(config.MAX_CONCURRENT_REQUESTS * 2, 128),
-        limit_per_host=0,
-        ttl_dns_cache=300,
-    )
-
-    runner: Optional[web.AppRunner] = None
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        api = LitecoinAPI(config, logger, session, semaphore=semaphore)
-        generator = LitecoinWalletGenerator()
-        writer = RenderResultWriter(config, logger, session=session, recent_winners=recent_winners)
-        display = DisplayManager(console)
-
-        scanner = LitecoinScanner(
-            config=config,
-            api=api,
-            generator=generator,
-            writer=writer,
-            display=display,
-            logger=logger,
-            console=console,
-            semaphore=semaphore,
-            recent_winners=recent_winners,
-        )
-
-        runner = await start_render_server(config, scanner)
-
-        loop = asyncio.get_running_loop()
-        if sys.platform != "win32":
-            for sig in (signal.SIGINT, signal.SIGTERM):
-                loop.add_signal_handler(sig, scanner.stop)
-
-        try:
-            await scanner.run()
-        except KeyboardInterrupt:
-            scanner.stop()
-        finally:
-            if runner is not None:
-                await runner.cleanup()
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nScanner terminated by user.")
-    except Exception as e:
-        print(f"Fatal error: {e}")
-        sys.exit(1)
