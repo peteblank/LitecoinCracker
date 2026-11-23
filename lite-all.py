@@ -37,7 +37,9 @@ except ImportError:
 
 
 DEFAULT_CANDIDATE_SEEDS: list[str] = [
-    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    "maze lizard hammer peanut globe few wolf swallow truly rough comfort legal
+
+motor forest luxury describe arrest figure office garment leisure sentence use expand",
 ]
 
 
