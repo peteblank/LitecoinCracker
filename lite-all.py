@@ -1145,4 +1145,4 @@ HTML_PAGE = r"""<!DOCTYPE html>
 """
 
 
-async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner
+async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
