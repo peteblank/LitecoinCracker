@@ -126,6 +126,22 @@ class GeneratedWallet:
     def total_balance(self) -> int:
         return sum(addr.balance for addr in self.addresses)
 
+    def to_dict(self) -> dict:
+        return {
+            "generated_at": self.generated_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "has_any_balance": self.has_any_balance,
+            "total_balance": self.total_balance,
+            "addresses": [
+                {
+                    "type": a.address_type.display_name,
+                    "address": a.address,
+                    "balance": a.balance,
+                    "tx_count": a.tx_count,
+                }
+                for a in self.addresses
+            ],
+        }
+
 
 @dataclass(slots=True)
 class ScannerStats:
@@ -196,6 +212,43 @@ class IResultWriter(ABC):
         pass
 
 
+class DynamicSemaphore:
+    """Asyncio semaphore whose concurrency limit can be adjusted at runtime."""
+
+    def __init__(self, initial_limit: int) -> None:
+        self._limit = max(1, int(initial_limit))
+        self._active = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    async def set_limit(self, new_limit: int) -> None:
+        async with self._cond:
+            self._limit = max(1, int(new_limit))
+            self._cond.notify_all()
+
+    async def acquire(self) -> None:
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._active < self._limit)
+            self._active += 1
+
+    def release(self) -> None:
+        async def _do_release() -> None:
+            async with self._cond:
+                self._active = max(0, self._active - 1)
+                self._cond.notify(1)
+
+        asyncio.create_task(_do_release())
+
+    async def __aenter__(self) -> None:
+        await self.acquire()
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+
 class LitecoinAPI(IBlockchainAPI):
     """High-throughput Litecoin blockchain API client with pooled connections."""
 
@@ -204,11 +257,12 @@ class LitecoinAPI(IBlockchainAPI):
         config: Config,
         logger: logging.Logger,
         session: aiohttp.ClientSession,
+        semaphore: Optional[DynamicSemaphore] = None,
     ) -> None:
         self._config = config
         self._logger = logger
         self._session = session
-        self._semaphore = asyncio.Semaphore(config.MAX_CONCURRENT_REQUESTS)
+        self._semaphore = semaphore or DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
         self._timeout = aiohttp.ClientTimeout(total=config.API_TIMEOUT)
         self._base = config.API_BASE_URL.rstrip("/")
 
@@ -365,7 +419,7 @@ class DisplayManager:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LitecoinScanner:
-    """Concurrent pipelined scanner orchestrator."""
+    """Concurrent pipelined scanner orchestrator with live runtime controls."""
 
     def __init__(
         self,
@@ -376,6 +430,7 @@ class LitecoinScanner:
         display: DisplayManager,
         logger: logging.Logger,
         console: Console,
+        semaphore: Optional[DynamicSemaphore] = None,
     ) -> None:
         self._config = config
         self._api = api
@@ -384,13 +439,75 @@ class LitecoinScanner:
         self._display = display
         self._logger = logger
         self._console = console
+        self._semaphore = semaphore or DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
         self._stats = ScannerStats()
         self._running = True
+        self._paused = False
+        self._workers_target = max(1, config.WORKERS)
+        self._request_delay = max(0.0, config.REQUEST_DELAY)
         self._latest_wallet: Optional[GeneratedWallet] = None
+        self._worker_tasks: list[asyncio.Task] = []
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     @property
     def stats(self) -> ScannerStats:
         return self._stats
+
+    @property
+    def is_running(self) -> bool:
+        return self._running and not self._paused
+
+    def runtime_info(self) -> dict:
+        s = self._stats
+        return {
+            "status": "stopped" if not self._running else ("paused" if self._paused else "running"),
+            "paused": self._paused,
+            "workers": self._workers_target,
+            "max_concurrent_requests": self._semaphore.limit,
+            "request_delay": self._request_delay,
+            "total_scanned": s.total_scanned,
+            "winners_found": s.winners_found,
+            "api_errors": s.api_errors,
+            "scan_rate_per_sec": round(s.scan_rate, 2),
+            "elapsed": s.elapsed_time,
+            "latest_wallet": self._latest_wallet.to_dict() if self._latest_wallet else None,
+        }
+
+    def _reconcile_workers(self) -> None:
+        if not self._running or self._loop is None:
+            return
+        self._worker_tasks = [t for t in self._worker_tasks if not t.done()]
+        desired = 0 if self._paused else self._workers_target
+        while len(self._worker_tasks) < desired:
+            self._worker_tasks.append(self._loop.create_task(self._worker()))
+        while len(self._worker_tasks) > desired:
+            task = self._worker_tasks.pop()
+            task.cancel()
+
+    async def set_paused(self, paused: bool) -> dict:
+        self._paused = bool(paused)
+        self._reconcile_workers()
+        return self.runtime_info()
+
+    async def update_runtime_config(
+        self,
+        workers: Optional[int] = None,
+        max_concurrent_requests: Optional[int] = None,
+        request_delay: Optional[float] = None,
+    ) -> dict:
+        if workers is not None:
+            self._workers_target = max(1, min(256, int(workers)))
+        if max_concurrent_requests is not None:
+            await self._semaphore.set_limit(max(1, min(512, int(max_concurrent_requests))))
+        if request_delay is not None:
+            self._request_delay = max(0.0, min(60.0, float(request_delay)))
+        self._reconcile_workers()
+        return self.runtime_info()
+
+    async def scan_once(self) -> dict:
+        wallet = self._generator.generate()
+        await self.process_wallet(wallet)
+        return wallet.to_dict()
 
     async def _fetch_address_info(self, address: WalletAddress) -> None:
         try:
@@ -417,11 +534,11 @@ class LitecoinScanner:
         self._latest_wallet = wallet
 
     async def _worker(self) -> None:
-        while self._running:
+        while self._running and not self._paused:
             wallet = self._generator.generate()
             await self.process_wallet(wallet)
-            if self._config.REQUEST_DELAY > 0:
-                await asyncio.sleep(self._config.REQUEST_DELAY)
+            if self._request_delay > 0 and self._running and not self._paused:
+                await asyncio.sleep(self._request_delay)
 
     async def _ui_loop(self, live: Live) -> None:
         layout = Layout()
@@ -443,8 +560,9 @@ class LitecoinScanner:
             await asyncio.sleep(self._config.STATUS_LOG_INTERVAL)
             if not self._running:
                 break
+            state = "PAUSED" if self._paused else "RUNNING"
             print(
-                f"Scanned={self._stats.total_scanned:,} | "
+                f"[{state}] Scanned={self._stats.total_scanned:,} | "
                 f"Winners={self._stats.winners_found} | "
                 f"Rate={self._stats.scan_rate:.2f}/s | "
                 f"Errors={self._stats.api_errors} | "
@@ -454,10 +572,20 @@ class LitecoinScanner:
 
     def stop(self) -> None:
         self._running = False
+        for task in self._worker_tasks:
+            task.cancel()
 
     async def run(self) -> None:
-        workers = [asyncio.create_task(self._worker()) for _ in range(self._config.WORKERS)]
+        self._loop = asyncio.get_running_loop()
+        self._reconcile_workers()
         is_tty = sys.stdout.isatty()
+
+        async def _watch_workers() -> None:
+            while self._running:
+                self._reconcile_workers()
+                await asyncio.sleep(0.25)
+
+        watcher = asyncio.create_task(_watch_workers())
 
         try:
             if is_tty:
@@ -469,7 +597,7 @@ class LitecoinScanner:
                     transient=True,
                 ) as live:
                     ui_task = asyncio.create_task(self._ui_loop(live))
-                    await asyncio.gather(*workers)
+                    await watcher
                     ui_task.cancel()
             else:
                 print(
@@ -477,13 +605,16 @@ class LitecoinScanner:
                     flush=True,
                 )
                 status_task = asyncio.create_task(self._headless_status_loop())
-                await asyncio.gather(*workers)
+                await watcher
                 status_task.cancel()
         except asyncio.CancelledError:
             pass
         finally:
             self._running = False
-            await asyncio.gather(*workers, return_exceptions=True)
+            watcher.cancel()
+            for task in self._worker_tasks:
+                task.cancel()
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
             self._print_summary(is_tty=is_tty)
 
     def _print_summary(self, is_tty: bool = True) -> None:
@@ -513,31 +644,310 @@ class LitecoinScanner:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Render HTTP Health / Status Server
+# Render HTTP Server & Interactive HTML Page
 # ══════════════════════════════════════════════════════════════════════════════
 
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Litecoin Scanner Control</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --card: #182028;
+      --border: #2b3846;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --accent: #38bdf8;
+      --green: #22c55e;
+      --amber: #f59e0b;
+      --red: #ef4444;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 24px;
+    }
+    .container { max-width: 920px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    h1 { margin: 0; font-size: 1.4rem; }
+    .badge {
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      background: var(--card);
+      border: 1px solid var(--border);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+    }
+    .label { color: var(--muted); font-size: 0.8rem; margin-bottom: 6px; }
+    .value { font-size: 1.35rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: end;
+      margin-bottom: 20px;
+    }
+    .field { display: flex; flex-direction: column; gap: 6px; }
+    .field label { font-size: 0.8rem; color: var(--muted); }
+    input {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 8px 10px;
+      width: 130px;
+      font-size: 0.95rem;
+    }
+    button {
+      background: var(--accent);
+      color: #081018;
+      border: none;
+      border-radius: 8px;
+      padding: 9px 14px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.secondary {
+      background: #25303d;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    button:hover { opacity: 0.92; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 10px;
+      font-size: 0.9rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--border);
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+    .msg { color: var(--muted); font-size: 0.85rem; margin-top: 8px; min-height: 1.2em; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Litecoin Scanner</h1>
+      <span id="statusBadge" class="badge">Loading...</span>
+    </div>
+
+    <div class="grid">
+      <div class="card"><div class="label">Total Scanned</div><div id="scanned" class="value">0</div></div>
+      <div class="card"><div class="label">Winners Found</div><div id="winners" class="value">0</div></div>
+      <div class="card"><div class="label">Scan Rate</div><div id="rate" class="value">0.00/s</div></div>
+      <div class="card"><div class="label">API Errors</div><div id="errors" class="value">0</div></div>
+      <div class="card"><div class="label">Elapsed</div><div id="elapsed" class="value">00:00:00</div></div>
+    </div>
+
+    <div class="card" style="margin-bottom: 20px;">
+      <div class="controls">
+        <button id="toggleBtn" onclick="toggleRun()">Pause</button>
+        <button class="secondary" onclick="scanOnce()">Scan 1 Wallet Now</button>
+        <div class="field">
+          <label for="workersInput">Workers</label>
+          <input id="workersInput" type="number" min="1" max="256" step="1" />
+        </div>
+        <div class="field">
+          <label for="concInput">Max Concurrent Reqs</label>
+          <input id="concInput" type="number" min="1" max="512" step="1" />
+        </div>
+        <div class="field">
+          <label for="delayInput">Request Delay (s)</label>
+          <input id="delayInput" type="number" min="0" max="60" step="0.05" />
+        </div>
+        <button class="secondary" onclick="saveConfig()">Apply Settings</button>
+      </div>
+      <div id="feedback" class="msg"></div>
+    </div>
+
+    <div class="card">
+      <div class="label">Latest Checked Wallet (<span id="latestTime">-</span>)</div>
+      <table>
+        <thead>
+          <tr>
+            <th>Type</th>
+            <th>Address</th>
+            <th>Balance</th>
+            <th>TxCount</th>
+          </tr>
+        </thead>
+        <tbody id="walletRows">
+          <tr><td colspan="4" style="color: var(--muted);">Waiting for scan data...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    let inputsInitialized = false;
+
+    function setFeedback(text) {
+      document.getElementById("feedback").textContent = text;
+    }
+
+    function renderState(data) {
+      const badge = document.getElementById("statusBadge");
+      badge.textContent = data.status.toUpperCase();
+      badge.style.color = data.status === "running" ? "#22c55e" : "#f59e0b";
+
+      document.getElementById("scanned").textContent = Number(data.total_scanned).toLocaleString();
+      document.getElementById("winners").textContent = Number(data.winners_found).toLocaleString();
+      document.getElementById("rate").textContent = `${Number(data.scan_rate_per_sec).toFixed(2)}/s`;
+      document.getElementById("errors").textContent = Number(data.api_errors).toLocaleString();
+      document.getElementById("elapsed").textContent = data.elapsed;
+      document.getElementById("toggleBtn").textContent = data.paused ? "Resume" : "Pause";
+
+      if (!inputsInitialized) {
+        document.getElementById("workersInput").value = data.workers;
+        document.getElementById("concInput").value = data.max_concurrent_requests;
+        document.getElementById("delayInput").value = data.request_delay;
+        inputsInitialized = true;
+      }
+
+      const tbody = document.getElementById("walletRows");
+      const latest = data.latest_wallet;
+      if (!latest || !latest.addresses || latest.addresses.length === 0) {
+        return;
+      }
+      document.getElementById("latestTime").textContent = latest.generated_at;
+      tbody.innerHTML = latest.addresses.map(a => `
+        <tr>
+          <td>${a.type}</td>
+          <td class="mono">${a.address}</td>
+          <td>${Number(a.balance).toLocaleString()}</td>
+          <td>${Number(a.tx_count).toLocaleString()}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function refreshStats() {
+      try {
+        const res = await fetch("/stats", { cache: "no-store" });
+        if (!res.ok) return;
+        const data = await res.json();
+        renderState(data);
+      } catch (_) {}
+    }
+
+    async function toggleRun() {
+      const res = await fetch("/api/toggle", { method: "POST" });
+      const data = await res.json();
+      renderState(data);
+      setFeedback(data.paused ? "Scanner paused." : "Scanner resumed.");
+    }
+
+    async function saveConfig() {
+      const payload = {
+        workers: Number(document.getElementById("workersInput").value),
+        max_concurrent_requests: Number(document.getElementById("concInput").value),
+        request_delay: Number(document.getElementById("delayInput").value),
+      };
+      const res = await fetch("/api/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      inputsInitialized = false;
+      renderState(data);
+      setFeedback("Settings updated.");
+    }
+
+    async function scanOnce() {
+      setFeedback("Scanning single wallet...");
+      const res = await fetch("/api/scan-once", { method: "POST" });
+      const wallet = await res.json();
+      document.getElementById("latestTime").textContent = wallet.generated_at;
+      document.getElementById("walletRows").innerHTML = wallet.addresses.map(a => `
+        <tr>
+          <td>${a.type}</td>
+          <td class="mono">${a.address}</td>
+          <td>${Number(a.balance).toLocaleString()}</td>
+          <td>${Number(a.tx_count).toLocaleString()}</td>
+        </tr>
+      `).join("");
+      setFeedback("Single wallet check complete.");
+      refreshStats();
+    }
+
+    refreshStats();
+    setInterval(refreshStats, 1500);
+  </script>
+</body>
+</html>
+"""
+
+
 async def start_render_server(config: Config, scanner: LitecoinScanner) -> web.AppRunner:
-    """Bind an HTTP server to 0.0.0.0:$PORT for Render Web Service health checks."""
+    """Bind an HTTP server to 0.0.0.0:$PORT with an interactive HTML UI and control API."""
+
+    async def handle_index(_request: web.Request) -> web.Response:
+        return web.Response(text=HTML_PAGE, content_type="text/html", status=200)
 
     async def handle_health(_request: web.Request) -> web.Response:
         return web.Response(text="ok", status=200)
 
     async def handle_stats(_request: web.Request) -> web.Response:
-        s = scanner.stats
-        payload = {
-            "status": "running" if scanner._running else "stopping",
-            "total_scanned": s.total_scanned,
-            "winners_found": s.winners_found,
-            "api_errors": s.api_errors,
-            "scan_rate_per_sec": round(s.scan_rate, 2),
-            "elapsed": s.elapsed_time,
-        }
-        return web.json_response(payload)
+        return web.json_response(scanner.runtime_info())
+
+    async def handle_toggle(_request: web.Request) -> web.Response:
+        info = await scanner.set_paused(not scanner._paused)
+        return web.json_response(info)
+
+    async def handle_config(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        info = await scanner.update_runtime_config(
+            workers=body.get("workers"),
+            max_concurrent_requests=body.get("max_concurrent_requests"),
+            request_delay=body.get("request_delay"),
+        )
+        return web.json_response(info)
+
+    async def handle_scan_once(_request: web.Request) -> web.Response:
+        result = await scanner.scan_once()
+        return web.json_response(result)
 
     app = web.Application()
-    app.router.add_get("/", handle_health)
+    app.router.add_get("/", handle_index)
     app.router.add_get("/health", handle_health)
     app.router.add_get("/stats", handle_stats)
+    app.router.add_post("/api/toggle", handle_toggle)
+    app.router.add_post("/api/config", handle_config)
+    app.router.add_post("/api/scan-once", handle_scan_once)
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
@@ -554,17 +964,18 @@ async def main() -> None:
     config = Config()
     console = Console()
     logger = setup_logging(config)
+    semaphore = DynamicSemaphore(config.MAX_CONCURRENT_REQUESTS)
 
     connector = aiohttp.TCPConnector(
-        limit=config.MAX_CONCURRENT_REQUESTS * 2,
-        limit_per_host=config.MAX_CONCURRENT_REQUESTS,
+        limit=max(config.MAX_CONCURRENT_REQUESTS * 2, 128),
+        limit_per_host=0,
         ttl_dns_cache=300,
     )
 
     runner: Optional[web.AppRunner] = None
 
     async with aiohttp.ClientSession(connector=connector) as session:
-        api = LitecoinAPI(config, logger, session)
+        api = LitecoinAPI(config, logger, session, semaphore=semaphore)
         generator = LitecoinWalletGenerator()
         writer = FileResultWriter(config, logger)
         display = DisplayManager(console)
@@ -577,6 +988,7 @@ async def main() -> None:
             display=display,
             logger=logger,
             console=console,
+            semaphore=semaphore,
         )
 
         runner = await start_render_server(config, scanner)
