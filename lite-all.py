@@ -38,8 +38,7 @@ except ImportError:
 
 DEFAULT_CANDIDATE_SEEDS: list[str] = [
     "maze lizard hammer peanut globe few wolf swallow truly rough comfort legal
-
-motor forest luxury describe arrest figure office garment leisure sentence use expand",
+    motor forest luxury describe arrest figure office garment leisure sentence use expand",
 ]
 
 
